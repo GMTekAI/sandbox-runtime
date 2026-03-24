@@ -49,6 +49,11 @@
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
 
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
+#endif
+
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
 #endif
@@ -164,27 +169,47 @@ int main(int argc, char *argv[]) {
         .filter = (struct sock_filter *)filter_bytes,
     };
 
-    uid_t uid = geteuid();
-    gid_t gid = getegid();
-
-    /* ---- Enter a new user namespace to gain CAP_SYS_ADMIN for the rest. ---- */
-    if (unshare(CLONE_NEWUSER) < 0) {
-        die("apply-seccomp: unshare(CLONE_NEWUSER) - nested user namespaces required");
-    }
-    /* setgroups must be denied before writing gid_map as an unprivileged user. */
-    if (write_file("/proc/self/setgroups", "deny") < 0) {
-        die("apply-seccomp: write /proc/self/setgroups");
-    }
-    if (write_file("/proc/self/uid_map", "%u %u 1\n", uid, uid) < 0) {
-        die("apply-seccomp: write /proc/self/uid_map");
-    }
-    if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
-        die("apply-seccomp: write /proc/self/gid_map");
-    }
-
-    /* ---- New PID + mount namespaces. Children (not us) enter the PID ns. ---- */
+    /* ---- New PID + mount namespaces. Children (not us) enter the PID ns. ----
+     *
+     * Two paths to get CAP_SYS_ADMIN for the unshare:
+     *   (a) The caller (bwrap) kept CAP_SYS_ADMIN in this user namespace via
+     *       --cap-add. Just unshare directly.
+     *   (b) We don't have the cap. Create a nested user namespace to get it,
+     *       map uid/gid, then unshare. This also works when apply-seccomp is
+     *       run standalone outside bwrap.
+     *
+     * Path (a) is tried first. If the caller didn't give us the cap, the
+     * kernel returns EPERM and we fall through to (b). Path (b) can itself
+     * fail on hosts where unprivileged user namespaces are gated by an LSM
+     * (Ubuntu 24.04's AppArmor restriction, for example) — the unshare
+     * succeeds but the new namespace grants no capabilities, so the setgroups
+     * write fails. In that case we abort: the caller must supply CAP_SYS_ADMIN.
+     */
     if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
-        die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS)");
+        if (errno != EPERM) {
+            die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS)");
+        }
+
+        uid_t uid = geteuid();
+        gid_t gid = getegid();
+
+        if (unshare(CLONE_NEWUSER) < 0) {
+            die("apply-seccomp: unshare(CLONE_NEWUSER)");
+        }
+        if (write_file("/proc/self/setgroups", "deny") < 0) {
+            die("apply-seccomp: write /proc/self/setgroups "
+                "(nested userns is capability-restricted; "
+                "caller must provide CAP_SYS_ADMIN)");
+        }
+        if (write_file("/proc/self/uid_map", "%u %u 1\n", uid, uid) < 0) {
+            die("apply-seccomp: write /proc/self/uid_map");
+        }
+        if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
+            die("apply-seccomp: write /proc/self/gid_map");
+        }
+        if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
+            die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
+        }
     }
 
     pid_t child = fork();
@@ -223,6 +248,13 @@ int main(int argc, char *argv[]) {
     }
     if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) {
         die("apply-seccomp: mount(/proc)");
+    }
+
+    /* bwrap --cap-add places CAP_SYS_ADMIN in the ambient set so it survives
+     * exec. Clear it now that the mount is done; combined with
+     * PR_SET_NO_NEW_PRIVS, the worker's execve drops to zero capabilities. */
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
+        die("apply-seccomp: prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
     }
 
     /* Fork the real workload so PID 1 can stay as a non-dumpable reaper. */

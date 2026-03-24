@@ -1110,6 +1110,17 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--proc', '/proc')
     }
 
+    if (seccompFilterPath) {
+      // apply-seccomp nests a PID+mount namespace to hide the unfiltered
+      // helpers above it. That unshare needs CAP_SYS_ADMIN in bwrap's user
+      // namespace. apply-seccomp can alternatively obtain it via a nested
+      // user namespace, but some hosts (e.g. Ubuntu 24.04 with AppArmor
+      // restrictions) grant a nested userns without capabilities, so we
+      // pass the cap explicitly. It is scoped to bwrap's user namespace
+      // and the sandboxed command loses it at exec via PR_SET_NO_NEW_PRIVS.
+      bwrapArgs.push('--cap-add', 'CAP_SYS_ADMIN')
+    }
+
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary since bwrap doesn't use $PATH

@@ -260,6 +260,36 @@ describe('apply-seccomp PID namespace isolation', () => {
     expect(r.stdout).toContain('DENIED')
   })
 
+  it('runs the user command with zero effective capabilities', () => {
+    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
+
+    // bwrap passes CAP_SYS_ADMIN (ambient) so apply-seccomp can nest a
+    // PID+mount namespace. apply-seccomp must clear the ambient set before
+    // exec so the workload cannot, e.g., umount /proc to reveal the outer
+    // namespace underneath.
+    const r = runApplySeccomp(['grep', 'CapEff', '/proc/self/status'])
+    expect(r.status).toBe(0)
+    expect(r.stdout).toMatch(/CapEff:\s*0+$/m)
+  })
+
+  it('denies umount(/proc) from the user command', () => {
+    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
+
+    const r = runApplySeccomp([
+      'python3',
+      '-c',
+      [
+        'import ctypes, os',
+        'libc = ctypes.CDLL(None, use_errno=True)',
+        'r = libc.umount2(b"/proc", 0)',
+        'print(f"r={r} errno={ctypes.get_errno()}")',
+        'exit(0 if r < 0 else 1)',
+      ].join('\n'),
+    ])
+    expect(r.status).toBe(0)
+    expect(r.stdout).toMatch(/r=-1 errno=1\b/) // EPERM
+  })
+
   it('denies process_vm_writev against PID 1', () => {
     if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
 
