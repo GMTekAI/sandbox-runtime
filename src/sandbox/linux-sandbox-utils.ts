@@ -1110,16 +1110,11 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--proc', '/proc')
     }
 
-    if (seccompFilterPath) {
-      // apply-seccomp nests a PID+mount namespace to hide the unfiltered
-      // helpers above it. That unshare needs CAP_SYS_ADMIN, which we grant
-      // via --cap-add inside a bwrap user namespace. --unshare-user forces
-      // user-namespace mode so the cap is namespace-scoped even when bwrap
-      // is installed setuid (where --cap-add would otherwise be rejected).
-      // apply-seccomp clears the ambient set before exec so the sandboxed
-      // command does not inherit the capability.
-      bwrapArgs.push('--unshare-user', '--cap-add', 'CAP_SYS_ADMIN')
-    }
+    // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
+    // by creating a nested user namespace. This requires the host to permit
+    // capability-bearing unprivileged user namespaces (the same requirement
+    // bwrap itself has when not installed setuid). See README for the
+    // Ubuntu 24.04 sysctl if AppArmor restricts this.
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work

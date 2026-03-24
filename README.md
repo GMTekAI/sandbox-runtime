@@ -439,6 +439,14 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
+**Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+or add an AppArmor profile that grants `userns` to the relevant binaries.
+
 **Optional Linux dependencies (for seccomp fallback):**
 
 The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
