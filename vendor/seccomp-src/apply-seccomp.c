@@ -115,32 +115,32 @@ static void install_forwarders(pid_t target) {
 }
 
 /*
- * Wait for `main_child` while reaping any other children. Returns an
- * exit(3)-style status for `main_child`: its exit code, or 128+signal.
+ * Wait for `main_child`, reaping any other children that exit first.
+ * Returns as soon as `main_child` terminates — the caller then _exit()s,
+ * which as PID 1 tears down the namespace and SIGKILLs any stragglers.
+ * Returns an exit(3)-style status: exit code, or 128+signal.
  */
 static int reap_until(pid_t main_child) {
     int status = 0;
-    int result = 1;
     for (;;) {
         pid_t r = waitpid(-1, &status, 0);
         if (r < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            /* ECHILD: no children left. */
-            break;
+            return 1;  /* ECHILD without seeing main_child — shouldn't happen. */
         }
         if (r == main_child) {
             if (WIFEXITED(status)) {
-                result = WEXITSTATUS(status);
-            } else if (WIFSIGNALED(status)) {
-                result = 128 + WTERMSIG(status);
+                return WEXITSTATUS(status);
             }
-            /* Keep reaping stragglers, but the answer is fixed now. */
-            main_child = -1;
+            if (WIFSIGNALED(status)) {
+                return 128 + WTERMSIG(status);
+            }
+            return 1;
         }
+        /* Reaped an orphan that died before main_child; keep waiting. */
     }
-    return result;
 }
 
 int main(int argc, char *argv[]) {

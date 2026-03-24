@@ -147,6 +147,18 @@ describe('apply-seccomp PID namespace isolation', () => {
     expect(r.status).toBe(7)
   })
 
+  it('exits when the main command exits, even with a long-running background process', () => {
+    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
+
+    // Inner init must return as soon as the worker exits, not wait for
+    // reparented background children. PID 1 exiting tears down the
+    // namespace and SIGKILLs the straggler.
+    const r = runApplySeccomp(['sh', '-c', 'sleep 100 & exit 5'], {
+      timeout: 3000,
+    })
+    expect(r.status).toBe(5)
+  })
+
   // ------------------------------------------------------------------
   // Seccomp still applies inside the nested namespace
   // ------------------------------------------------------------------
