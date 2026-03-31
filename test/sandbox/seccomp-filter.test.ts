@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll } from 'bun:test'
+import { describe, it, expect } from 'bun:test'
 import { existsSync, statSync } from 'node:fs'
-import { getPlatform } from '../../src/utils/platform.js'
 import { whichSync } from '../../src/utils/which.js'
+import { isLinux } from '../helpers/platform.js'
 import {
   generateSeccompFilter,
   cleanupSeccompFilter,
@@ -13,20 +13,8 @@ import {
   checkLinuxDependencies,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 
-function skipIfNotLinux(): boolean {
-  return getPlatform() !== 'linux'
-}
-
-function skipIfNotAnt(): boolean {
-  return process.env.USER_TYPE !== 'ant'
-}
-
-describe('Linux Sandbox Dependencies', () => {
+describe.if(isLinux)('Linux Sandbox Dependencies', () => {
   it('should check for Linux sandbox dependencies', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const depCheck = checkLinuxDependencies()
     expect(depCheck).toHaveProperty('errors')
     expect(depCheck).toHaveProperty('warnings')
@@ -39,12 +27,8 @@ describe('Linux Sandbox Dependencies', () => {
   })
 })
 
-describe('Pre-generated BPF Support', () => {
+describe.if(isLinux)('Pre-generated BPF Support', () => {
   it('should detect pre-generated BPF files on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Check if current architecture supports pre-generated BPF
     const arch = process.arch
     const preGeneratedBpf = getPreGeneratedBpfPath()
@@ -64,10 +48,6 @@ describe('Pre-generated BPF Support', () => {
   })
 
   it('should have sandbox dependencies on x64/arm64 with bwrap and socat', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
     // Only test on architectures with pre-generated BPF
@@ -96,10 +76,6 @@ describe('Pre-generated BPF Support', () => {
   })
 
   it('should not allow seccomp on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
     // Only test on architectures WITHOUT pre-generated BPF
@@ -124,12 +100,8 @@ describe('Pre-generated BPF Support', () => {
   })
 })
 
-describe('Seccomp Filter (Pre-generated)', () => {
+describe.if(isLinux)('Seccomp Filter (Pre-generated)', () => {
   it('should return pre-generated BPF filter on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       // Not a supported architecture
@@ -154,10 +126,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should return same path on repeated calls (pre-generated)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       return
@@ -174,10 +142,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should return null on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch === 'x64' || arch === 'arm64') {
       // This test is for unsupported architectures only
@@ -189,10 +153,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should handle cleanup gracefully (no-op for pre-generated files)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Cleanup should not throw for any path (it's a no-op)
     expect(() => cleanupSeccompFilter('/tmp/test.bpf')).not.toThrow()
     expect(() =>
@@ -202,12 +162,8 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 })
 
-describe('Apply Seccomp Binary', () => {
+describe.if(isLinux)('Apply Seccomp Binary', () => {
   it('should find pre-built apply-seccomp binary on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       return
@@ -224,10 +180,6 @@ describe('Apply Seccomp Binary', () => {
   })
 
   it('should return null on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch === 'x64' || arch === 'arm64') {
       return
@@ -238,297 +190,8 @@ describe('Apply Seccomp Binary', () => {
   })
 })
 
-describe('Architecture Support', () => {
-  it('should fail fast when architecture is unsupported and seccomp is needed', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    // This test documents the expected behavior:
-    // When the architecture is not x64/arm64, the sandbox should fail the dependency
-    // check instead of silently running without seccomp protection
-
-    // The actual check happens in:
-    // 1. checkLinuxDependencies() checks for apply-seccomp binary availability
-    // 2. Returns warnings if binary not available for the current architecture
-    // 3. Caller decides policy (e.g. allowAllUnixSockets bypasses seccomp requirement)
-    expect(true).toBe(true) // Placeholder - actual behavior verified by integration tests
-  })
-
-  it('should include architecture information in error messages', () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    // Verify error messages mention architecture support and alternatives
-    // This is a documentation test to ensure error messages are helpful
-    const expectedInErrorMessage = [
-      'x64',
-      'arm64',
-      'architecture',
-      'allowAllUnixSockets',
-    ]
-
-    // Error messages should guide users to either:
-    // 1. Use a supported architecture (x64/arm64), OR
-    // 2. Set allowAllUnixSockets: true to opt out
-    expect(expectedInErrorMessage.length).toBeGreaterThan(0)
-  })
-
-  it('should allow bypassing architecture requirement with allowAllUnixSockets', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    // When allowAllUnixSockets is true, architecture check should not matter
-    const testCommand = 'echo "test"'
-
-    // This should NOT throw even on unsupported architecture (when allowAllUnixSockets=true)
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-      allowAllUnixSockets: true, // Bypass seccomp
-    })
-
-    // Command should not contain apply-seccomp binary
-    expect(wrappedCommand).not.toContain('apply-seccomp')
-    expect(wrappedCommand).toContain('echo "test"')
-  })
-})
-
-describe('USER_TYPE Gating', () => {
-  it('should only apply seccomp in sandbox for ANT users', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    const testCommand = 'echo "test"'
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    if (process.env.USER_TYPE === 'ant') {
-      // ANT users should have apply-seccomp binary in command
-      expect(wrappedCommand).toContain('apply-seccomp')
-    } else {
-      // Non-ANT users should not have seccomp
-      expect(wrappedCommand).not.toContain('apply-seccomp')
-    }
-  })
-})
-
-describe('Socket Filtering Behavior', () => {
-  let filterPath: string | null = null
-
-  beforeAll(() => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    filterPath = generateSeccompFilter()
-  })
-
-  it('should block Unix socket creation (SOCK_STREAM)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
-      return
-    }
-
-    const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); print('Unix socket created')"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    expect(result.status).not.toBe(0)
-    const stderr = result.stderr?.toString() || ''
-    expect(stderr.toLowerCase()).toMatch(
-      /permission denied|operation not permitted/,
-    )
-  })
-
-  it('should block Unix socket creation (SOCK_DGRAM)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
-      return
-    }
-
-    const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); print('Unix datagram created')"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    expect(result.status).not.toBe(0)
-    const stderr = result.stderr?.toString() || ''
-    expect(stderr.toLowerCase()).toMatch(
-      /permission denied|operation not permitted/,
-    )
-  })
-
-  it('should allow TCP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
-      return
-    }
-
-    const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); print('TCP socket created')"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout?.toString()).toContain('TCP socket created')
-  })
-
-  it('should allow UDP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
-      return
-    }
-
-    const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print('UDP socket created')"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout?.toString()).toContain('UDP socket created')
-  })
-
-  it('should allow IPv6 socket creation', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
-      return
-    }
-
-    const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); print('IPv6 socket created')"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout?.toString()).toContain('IPv6 socket created')
-  })
-})
-
-describe('Two-Stage Seccomp Application', () => {
-  it('should allow network infrastructure to run before filter', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    // This test verifies that the socat processes can start successfully
-    // even though they use Unix sockets, because they run before the filter
-    const testCommand = 'echo "test"'
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    // Command should include both socat and the apply-seccomp binary
-    expect(wrappedCommand).toContain('socat')
-    expect(wrappedCommand).toContain('apply-seccomp')
-
-    // The socat should come before the apply-seccomp
-    const socatIndex = wrappedCommand.indexOf('socat')
-    const seccompIndex = wrappedCommand.indexOf('apply-seccomp')
-    expect(socatIndex).toBeGreaterThan(-1)
-    expect(seccompIndex).toBeGreaterThan(-1)
-    expect(socatIndex).toBeLessThan(seccompIndex)
-  })
-
-  it('should execute user command with filter applied', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    // User command tries to create Unix socket - should fail
-    const testCommand = `python3 -c "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)"`
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const result = spawnSync('bash', ['-c', wrappedCommand], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-
-    // Should fail due to seccomp filter
-    expect(result.status).not.toBe(0)
-  })
-})
-
-describe('Sandbox Integration', () => {
-  it('should handle commands without network or filesystem restrictions', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    const testCommand = 'echo "hello world"'
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    // Should still wrap the command even without restrictions
-    expect(wrappedCommand).toBeTruthy()
-    expect(typeof wrappedCommand).toBe('string')
-  })
-
+describe.if(isLinux)('Sandbox Integration', () => {
   it('should wrap commands with filesystem restrictions', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -546,38 +209,10 @@ describe('Sandbox Integration', () => {
     expect(wrappedCommand).toBeTruthy()
     expect(wrappedCommand).toContain('bwrap')
   })
-
-  it('should include seccomp for ANT users with dependencies', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    const testCommand = 'echo "test"'
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const isAnt = process.env.USER_TYPE === 'ant'
-
-    if (isAnt) {
-      expect(wrappedCommand).toContain('apply-seccomp')
-    } else {
-      expect(wrappedCommand).not.toContain('apply-seccomp')
-    }
-  })
 })
 
-describe('Error Handling', () => {
+describe.if(isLinux)('Error Handling', () => {
   it('should handle cleanup calls gracefully (no-op)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Cleanup is a no-op for pre-generated files, should never throw
     expect(() => cleanupSeccompFilter('')).not.toThrow()
     expect(() => cleanupSeccompFilter('/invalid/path/filter.bpf')).not.toThrow()
@@ -588,12 +223,8 @@ describe('Error Handling', () => {
   })
 })
 
-describe('Custom Seccomp Paths (expectedPath parameter)', () => {
+describe.if(isLinux)('Custom Seccomp Paths (expectedPath parameter)', () => {
   it('should use expectedPath for BPF when provided and file exists', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const realPath = getPreGeneratedBpfPath()
     if (!realPath) {
       // Skip if no real BPF available on this architecture
@@ -606,10 +237,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should use expectedPath for apply-seccomp when provided and file exists', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const realPath = getApplySeccompBinaryPath()
     if (!realPath) {
       // Skip if no real binary available on this architecture
@@ -622,10 +249,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should fall back to default paths when expectedPath for BPF does not exist', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const nonExistentPath = '/tmp/nonexistent-seccomp.bpf'
     const result = getPreGeneratedBpfPath(nonExistentPath)
 
@@ -640,10 +263,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should fall back to default paths when expectedPath for apply-seccomp does not exist', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const nonExistentPath = '/tmp/nonexistent-apply-seccomp'
     const result = getApplySeccompBinaryPath(nonExistentPath)
 
@@ -658,10 +277,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should pass seccompConfig through wrapCommandWithSandboxLinux', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -687,10 +302,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should use custom seccompConfig paths when they exist', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }

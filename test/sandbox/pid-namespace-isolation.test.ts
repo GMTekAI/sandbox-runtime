@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { getPlatform } from '../../src/utils/platform.js'
 import {
   getApplySeccompBinaryPath,
   getPreGeneratedBpfPath,
@@ -10,6 +9,7 @@ import {
   wrapCommandWithSandboxLinux,
   checkLinuxDependencies,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import { isLinux } from '../helpers/platform.js'
 
 /**
  * Tests for the nested PID namespace isolation in apply-seccomp.
@@ -22,10 +22,6 @@ import {
  * These tests exercise apply-seccomp directly and through the full
  * bwrap wrapper to verify both layers hold.
  */
-
-function skipIfNotLinux(): boolean {
-  return getPlatform() !== 'linux'
-}
 
 let applySeccomp: string | null = null
 let bpfFilter: string | null = null
@@ -45,15 +41,12 @@ function runApplySeccomp(
   }
 }
 
-describe('apply-seccomp PID namespace isolation', () => {
+describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
   beforeAll(() => {
-    if (skipIfNotLinux()) return
     applySeccomp = getApplySeccompBinaryPath()
     bpfFilter = getPreGeneratedBpfPath()
-  })
-
-  it('has the apply-seccomp binary and BPF filter available', () => {
-    if (skipIfNotLinux()) return
+    // On Linux CI with vendor/seccomp files present these always resolve.
+    // If they're null, every test below would silently no-op — fail here.
     expect(applySeccomp).toBeTruthy()
     expect(bpfFilter).toBeTruthy()
     expect(existsSync(applySeccomp!)).toBe(true)
@@ -65,8 +58,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   // ------------------------------------------------------------------
 
   it('runs the command as PID 2 under an apply-seccomp init (PID 1)', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'sh',
       '-c',
@@ -78,8 +69,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('shows only the inner namespace in /proc', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'sh',
       '-c',
@@ -97,8 +86,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('forwards exit codes from the inner command', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     expect(runApplySeccomp(['sh', '-c', 'exit 0']).status).toBe(0)
     expect(runApplySeccomp(['sh', '-c', 'exit 1']).status).toBe(1)
     expect(runApplySeccomp(['sh', '-c', 'exit 42']).status).toBe(42)
@@ -106,15 +93,11 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('forwards signal exits as 128+signo', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp(['sh', '-c', 'kill -TERM $$'])
     expect(r.status).toBe(128 + 15)
   })
 
   it('forwards SIGTERM from the outside through both inits to the command', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     // PID 1 drops signals it has no handler for. apply-seccomp's inner init
     // must install handlers so SIGTERM from the caller actually reaches the
     // workload.
@@ -136,8 +119,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('reaps orphaned grandchildren without leaking zombies', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     // Spawn a grandchild that outlives its parent; inner init (PID 1)
     // must reap it. If reaping is broken this either hangs or leaves
     // the grandchild running — the timeout catches both.
@@ -148,8 +129,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('exits when the main command exits, even with a long-running background process', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     // Inner init must return as soon as the worker exits, not wait for
     // reparented background children. PID 1 exiting tears down the
     // namespace and SIGKILLs the straggler.
@@ -164,8 +143,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   // ------------------------------------------------------------------
 
   it('blocks AF_UNIX socket creation', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -178,8 +155,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('allows AF_INET socket creation', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -190,8 +165,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('blocks io_uring_setup (IORING_OP_SOCKET bypass of socket() filter)', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     // IORING_OP_SOCKET (Linux 5.19+) creates sockets in kernel context,
     // bypassing seccomp's socket() rule. The filter must block
     // io_uring_setup so no ring can be created.
@@ -213,8 +186,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('blocks io_uring_enter (covers inherited ring fd)', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -234,8 +205,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   // ------------------------------------------------------------------
 
   it('denies ptrace(PTRACE_ATTACH) against PID 1', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -253,8 +222,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('denies opening /proc/1/mem for writing', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -273,8 +240,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('runs the user command with zero effective capabilities', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     // bwrap passes CAP_SYS_ADMIN (ambient) so apply-seccomp can nest a
     // PID+mount namespace. apply-seccomp must clear the ambient set before
     // exec so the workload cannot, e.g., umount /proc to reveal the outer
@@ -285,8 +250,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('denies umount(/proc) from the user command', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -303,8 +266,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('denies process_vm_writev against PID 1', () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter) return
-
     const r = runApplySeccomp([
       'python3',
       '-c',
@@ -331,8 +292,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   // ------------------------------------------------------------------
 
   it('fails closed when the BPF filter is missing', () => {
-    if (skipIfNotLinux() || !applySeccomp) return
-
     const r = spawnSync(
       applySeccomp!,
       ['/nonexistent/filter.bpf', 'echo', 'x'],
@@ -346,8 +305,6 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 
   it('fails closed when the BPF filter is malformed', () => {
-    if (skipIfNotLinux() || !applySeccomp) return
-
     // /etc/hostname is not a multiple of 8 bytes and not a valid BPF program.
     const r = spawnSync(applySeccomp!, ['/etc/hostname', 'echo', 'leaked'], {
       stdio: 'pipe',
@@ -358,99 +315,92 @@ describe('apply-seccomp PID namespace isolation', () => {
   })
 })
 
-describe('Full bwrap integration — outer processes are unreachable', () => {
-  beforeAll(() => {
-    if (skipIfNotLinux()) return
-    applySeccomp = getApplySeccompBinaryPath()
-    bpfFilter = getPreGeneratedBpfPath()
-  })
-
-  function canRunBwrap(): boolean {
-    return checkLinuxDependencies().errors.length === 0
-  }
-
-  it('hides outer-namespace helpers (socat analogue) from the inner command', async () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter || !canRunBwrap())
-      return
-
-    // Spawn a background `sleep` in the outer bwrap namespace (stand-in for
-    // socat), then run apply-seccomp. The inner command must not see `sleep`
-    // in /proc.
-    const wrapped = await wrapCommandWithSandboxLinux({
-      command: [
-        'sleep 30 &',
-        'SLEEP_OUTER=$!',
-        'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep',
-        'OUTER_SAW=$?',
-        `${applySeccomp} ${bpfFilter} sh -c '` +
-          'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep; ' +
-          'echo "INNER_SAW=$?"' +
-          `'`,
-        'kill $SLEEP_OUTER 2>/dev/null',
-        'echo "OUTER_SAW=$OUTER_SAW"',
-      ].join('\n'),
-      needsNetworkRestriction: false,
-      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      allowAllUnixSockets: true, // we invoke apply-seccomp ourselves here
+describe.if(isLinux)(
+  'Full bwrap integration — outer processes are unreachable',
+  () => {
+    beforeAll(() => {
+      applySeccomp = getApplySeccompBinaryPath()
+      bpfFilter = getPreGeneratedBpfPath()
+      expect(applySeccomp).toBeTruthy()
+      expect(bpfFilter).toBeTruthy()
+      // CI apt-installs bwrap and socat; if missing the suite would no-op.
+      expect(checkLinuxDependencies().errors).toEqual([])
     })
 
-    const r = spawnSync('bash', ['-c', wrapped], {
-      stdio: 'pipe',
-      timeout: 15000,
-    })
-    const out = r.stdout?.toString() ?? ''
-    // Outer namespace sees the sleep (grep exit 0), inner does not (grep exit 1).
-    expect(out).toContain('OUTER_SAW=0')
-    expect(out).toContain('INNER_SAW=1')
-  })
+    it('hides outer-namespace helpers (socat analogue) from the inner command', async () => {
+      // Spawn a background `sleep` in the outer bwrap namespace (stand-in for
+      // socat), then run apply-seccomp. The inner command must not see `sleep`
+      // in /proc.
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: [
+          'sleep 30 &',
+          'SLEEP_OUTER=$!',
+          'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep',
+          'OUTER_SAW=$?',
+          `${applySeccomp} ${bpfFilter} sh -c '` +
+            'for p in /proc/[0-9]*; do cat "$p/comm" 2>/dev/null; done | grep -qx sleep; ' +
+            'echo "INNER_SAW=$?"' +
+            `'`,
+          'kill $SLEEP_OUTER 2>/dev/null',
+          'echo "OUTER_SAW=$OUTER_SAW"',
+        ].join('\n'),
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        allowAllUnixSockets: true, // we invoke apply-seccomp ourselves here
+      })
 
-  it('cannot ptrace the real bwrap init from inside the sandbox', async () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter || !canRunBwrap())
-      return
-
-    // With the normal wrapper (seccomp on), PID 1 from the user command's
-    // view is apply-seccomp's non-dumpable init, not bwrap.
-    const wrapped = await wrapCommandWithSandboxLinux({
-      command: [
-        'python3 -c "',
-        'import ctypes, os',
-        'libc = ctypes.CDLL(None, use_errno=True)',
-        'r = libc.ptrace(16, 1, 0, 0)',
-        'err = ctypes.get_errno()',
-        'comm = open(\\"/proc/1/comm\\").read().strip()',
-        'print(f\\"ptrace={r} errno={err} pid1={comm}\\")',
-        '"',
-      ].join('\n'),
-      needsNetworkRestriction: false,
-      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-    })
-
-    const r = spawnSync('bash', ['-c', wrapped], {
-      stdio: 'pipe',
-      timeout: 15000,
-    })
-    const out = r.stdout?.toString() ?? ''
-    expect(out).toMatch(/ptrace=-1/)
-    expect(out).toMatch(/pid1=apply-seccomp/)
-  })
-
-  it('cannot open bwrap /proc/1/mem from inside the sandbox', async () => {
-    if (skipIfNotLinux() || !applySeccomp || !bpfFilter || !canRunBwrap())
-      return
-
-    const wrapped = await wrapCommandWithSandboxLinux({
-      command:
-        'python3 -c "open(\\"/proc/1/mem\\", \\"r+b\\")" 2>&1 || echo BLOCKED',
-      needsNetworkRestriction: false,
-      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      const r = spawnSync('bash', ['-c', wrapped], {
+        stdio: 'pipe',
+        timeout: 15000,
+      })
+      const out = r.stdout?.toString() ?? ''
+      // Outer namespace sees the sleep (grep exit 0), inner does not (grep exit 1).
+      expect(out).toContain('OUTER_SAW=0')
+      expect(out).toContain('INNER_SAW=1')
     })
 
-    const r = spawnSync('bash', ['-c', wrapped], {
-      stdio: 'pipe',
-      timeout: 15000,
+    it('cannot ptrace the real bwrap init from inside the sandbox', async () => {
+      // With the normal wrapper (seccomp on), PID 1 from the user command's
+      // view is apply-seccomp's non-dumpable init, not bwrap.
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: [
+          'python3 -c "',
+          'import ctypes, os',
+          'libc = ctypes.CDLL(None, use_errno=True)',
+          'r = libc.ptrace(16, 1, 0, 0)',
+          'err = ctypes.get_errno()',
+          'comm = open(\\"/proc/1/comm\\").read().strip()',
+          'print(f\\"ptrace={r} errno={err} pid1={comm}\\")',
+          '"',
+        ].join('\n'),
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      })
+
+      const r = spawnSync('bash', ['-c', wrapped], {
+        stdio: 'pipe',
+        timeout: 15000,
+      })
+      const out = r.stdout?.toString() ?? ''
+      expect(out).toMatch(/ptrace=-1/)
+      expect(out).toMatch(/pid1=apply-seccomp/)
     })
-    const out = r.stdout?.toString() ?? ''
-    expect(out).toContain('BLOCKED')
-    expect(out.toLowerCase()).toMatch(/permission denied/)
-  })
-})
+
+    it('cannot open bwrap /proc/1/mem from inside the sandbox', async () => {
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command:
+          'python3 -c "open(\\"/proc/1/mem\\", \\"r+b\\")" 2>&1 || echo BLOCKED',
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      })
+
+      const r = spawnSync('bash', ['-c', wrapped], {
+        stdio: 'pipe',
+        timeout: 15000,
+      })
+      const out = r.stdout?.toString() ?? ''
+      expect(out).toContain('BLOCKED')
+      expect(out.toLowerCase()).toMatch(/permission denied/)
+    })
+  },
+)

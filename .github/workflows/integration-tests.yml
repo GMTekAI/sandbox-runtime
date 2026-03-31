@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: ['**']
+    branches: ['main']
   pull_request:
     branches: ['**']
 
@@ -73,18 +73,11 @@ jobs:
       - name: Build project
         run: npm run build
 
-      - name: Run unit tests
-        run: npm run test:unit
+      - name: Run tests
+        run: npm test
 
       - name: Run Node.js fallback tests
         run: node test/utils/which-node-test.mjs
-
-      - name: Run integration tests
-        run: npm run test:integration
-
-      - name: Run mandatory-deny-paths tests (Linux)
-        if: matrix.os == 'linux'
-        run: bun test test/sandbox/mandatory-deny-paths.test.ts
 
       - name: Upload test results
         if: always()
@@ -95,3 +88,51 @@ jobs:
             test-results/
             *.log
           if-no-files-found: ignore
+
+  docker-tests:
+    # Run the suite inside an unprivileged container — the environment
+    # enableWeakerNestedSandbox targets. seccomp unconfined so bwrap can
+    # unshare(CLONE_NEWUSER); no CAP_SYS_ADMIN so --proc /proc fails.
+    name: Tests (docker / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable unprivileged user namespaces on host
+        run: |
+          # The container shares the host kernel; this sysctl must be set on
+          # the host for bwrap/apply-seccomp to nest namespaces inside.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - name: Run tests in unprivileged container
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            ubuntu:24.04 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip git zsh
+              curl -fsSL https://bun.sh/install | bash
+              export PATH="$HOME/.bun/bin:$PATH"
+              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+              apt-get install -y -qq nodejs
+              npm install
+              npm run build
+              npm test
+            '
