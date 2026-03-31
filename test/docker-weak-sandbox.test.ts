@@ -44,6 +44,7 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
     writeFileSync(
       CONFIG,
       JSON.stringify({
+        network: { allowedDomains: [], deniedDomains: [] },
         filesystem: {
           denyRead: [],
           allowWrite: [ALLOWED],
