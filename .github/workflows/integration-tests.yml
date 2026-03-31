@@ -84,9 +84,6 @@ jobs:
 
       - name: Run mandatory-deny-paths tests (Linux)
         if: matrix.os == 'linux'
-        # Exercises enableWeakerNestedSandbox — the two tests that broke
-        # when apply-seccomp started nesting namespaces. Add explicitly
-        # until the full-suite CI change lands.
         run: bun test test/sandbox/mandatory-deny-paths.test.ts
 
       - name: Upload test results
