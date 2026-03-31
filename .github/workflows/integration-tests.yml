@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ['**']
   pull_request:
-    branches: [ "**" ]
+    branches: ['**']
 
 jobs:
   integration-tests:
@@ -81,6 +81,13 @@ jobs:
 
       - name: Run integration tests
         run: npm run test:integration
+
+      - name: Run mandatory-deny-paths tests (Linux)
+        if: matrix.os == 'linux'
+        # Exercises enableWeakerNestedSandbox — the two tests that broke
+        # when apply-seccomp started nesting namespaces. Add explicitly
+        # until the full-suite CI change lands.
+        run: bun test test/sandbox/mandatory-deny-paths.test.ts
 
       - name: Upload test results
         if: always()
