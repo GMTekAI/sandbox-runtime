@@ -333,6 +333,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       expect(result2.status).toBe(0)
       expect(result2.stdout).toContain('Example Domain')
     },
+    20000,
   )
 
   it.if(isLinux)(
@@ -374,6 +375,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const output2 = (result2.stdout + result2.stderr).toLowerCase()
       expect(output2).not.toContain('example domain')
     },
+    20000,
   )
 
   it.if(isLinux)(
@@ -404,6 +406,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       expect(result.status).toBe(0)
       expect(result.stdout).toContain('Example Domain')
     },
+    20000,
   )
 
   /**
