@@ -1212,6 +1212,16 @@ export async function wrapCommandWithSandboxLinux(
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode)
       bwrapArgs.push('--proc', '/proc')
+    } else {
+      // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
+      // unprivileged container (Docker's default: EUID=0 without
+      // CAP_SYS_ADMIN), bwrap assumes it has caps, tries direct clone,
+      // and EPERMs. Force the userns path so bwrap starts at all.
+      //
+      // --bind /proc /proc: apply-seccomp's nested-userns path writes
+      // /proc/self/setgroups and uid_map. Without --proc above, the
+      // --ro-bind / / leaves /proc read-only and those writes EROFS.
+      bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc')
     }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare

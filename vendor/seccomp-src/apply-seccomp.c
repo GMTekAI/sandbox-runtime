@@ -246,7 +246,13 @@ int main(int argc, char *argv[]) {
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
         die("apply-seccomp: mount(MS_PRIVATE)");
     }
-    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) {
+    /* EPERM here means a masked /proc is underneath (unprivileged Docker)
+     * and the kernel domination check refused the overmount. The nested
+     * userns above is the isolation boundary; this remount only hides
+     * outer PIDs from `ls /proc`. enableWeakerNestedSandbox targets
+     * exactly this environment. */
+    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0
+        && errno != EPERM) {
         die("apply-seccomp: mount(/proc)");
     }
 
