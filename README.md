@@ -288,10 +288,10 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 **Unix Socket Settings** (platform-specific behavior):
 
-| Setting | macOS | Linux |
-|---------|-------|-------|
-| `allowUnixSockets: string[]` | Allowlist of socket paths | *Ignored* (seccomp can't filter by path) |
-| `allowAllUnixSockets: boolean` | Allow all sockets | Disable seccomp blocking |
+| Setting                        | macOS                     | Linux                                    |
+| ------------------------------ | ------------------------- | ---------------------------------------- |
+| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
+| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
 
 Unix sockets are **blocked by default** on both platforms.
 
@@ -477,9 +477,6 @@ npm run build:seccomp
 
 # Run tests
 npm test
-
-# Run integration tests
-npm run test:integration
 
 # Type checking
 npm run typecheck
