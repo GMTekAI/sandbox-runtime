@@ -10,15 +10,11 @@ import {
 // just the piece it's exercising. spyOn patches the export binding, so
 // linux-sandbox-utils' own imports see the replacement.
 let whichSpy: ReturnType<typeof spyOn>
-let bpfSpy: ReturnType<typeof spyOn>
 let applySpy: ReturnType<typeof spyOn>
 
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
     (bin: string) => `/usr/bin/${bin}`,
-  )
-  bpfSpy = spyOn(seccomp, 'getPreGeneratedBpfPath').mockReturnValue(
-    '/path/to/filter.bpf',
   )
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
     '/path/to/apply-seccomp',
@@ -27,7 +23,6 @@ beforeEach(() => {
 
 afterEach(() => {
   whichSpy.mockRestore()
-  bpfSpy.mockRestore()
   applySpy.mockRestore()
 })
 
@@ -71,8 +66,7 @@ describe('checkLinuxDependencies', () => {
     expect(result.errors.length).toBe(2)
   })
 
-  test('returns warning (not error) when seccomp missing', () => {
-    bpfSpy.mockReturnValue(null)
+  test('returns warning when apply-seccomp missing', () => {
     applySpy.mockReturnValue(null)
 
     const result = checkLinuxDependencies()
@@ -82,22 +76,9 @@ describe('checkLinuxDependencies', () => {
     )
   })
 
-  test('returns warning when only bpf file present (no apply binary)', () => {
-    applySpy.mockReturnValue(null)
+  test('passes custom applyPath through to the resolver', () => {
+    checkLinuxDependencies({ applyPath: '/custom/apply' })
 
-    const result = checkLinuxDependencies()
-
-    expect(result.errors).toEqual([])
-    expect(result.warnings.length).toBe(1)
-  })
-
-  test('passes custom seccomp paths through to the resolvers', () => {
-    checkLinuxDependencies({
-      bpfPath: '/custom/path.bpf',
-      applyPath: '/custom/apply',
-    })
-
-    expect(bpfSpy).toHaveBeenCalledWith('/custom/path.bpf')
     expect(applySpy).toHaveBeenCalledWith('/custom/apply')
   })
 })
@@ -108,7 +89,6 @@ describe('getLinuxDependencyStatus', () => {
 
     expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)
-    expect(status.hasSeccompBpf).toBe(true)
     expect(status.hasSeccompApply).toBe(true)
   })
 
@@ -134,13 +114,11 @@ describe('getLinuxDependencyStatus', () => {
     expect(status.hasBwrap).toBe(true)
   })
 
-  test('reports seccomp unavailable when files missing', () => {
-    bpfSpy.mockReturnValue(null)
+  test('reports seccomp unavailable when apply binary missing', () => {
     applySpy.mockReturnValue(null)
 
     const status = getLinuxDependencyStatus()
 
-    expect(status.hasSeccompBpf).toBe(false)
     expect(status.hasSeccompApply).toBe(false)
     expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)

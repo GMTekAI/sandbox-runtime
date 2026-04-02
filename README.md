@@ -472,9 +472,6 @@ npm install
 # Build the project
 npm run build
 
-# Build seccomp binaries (requires Docker)
-npm run build:seccomp
-
 # Run tests
 npm test
 
@@ -490,18 +487,7 @@ npm run format
 
 ### Building Seccomp Binaries
 
-The pre-generated BPF filters are included in the repository, but you can rebuild them if needed:
-
-```bash
-npm run build:seccomp
-```
-
-This script uses Docker to cross-compile seccomp binaries for multiple architectures:
-
-- x64 (x86-64)
-- arm64 (aarch64)
-
-The script builds static generator binaries, generates the BPF filters (~104 bytes each), and stores them in `vendor/seccomp/x64/` and `vendor/seccomp/arm64/`. The generator binaries are removed to keep the package size small.
+The BPF filter and `apply-seccomp` loader are compiled from C source in `vendor/seccomp-src/` via `npm run build:seccomp` (Linux only; needs `gcc` and `libseccomp-dev`). CI runs it before tests on each Linux arch, and the release workflow builds both arches and bundles them into the published package.
 
 ## Implementation Details
 

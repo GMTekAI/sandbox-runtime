@@ -206,13 +206,8 @@ export const RipgrepConfigSchema = z.object({
 
 /**
  * Seccomp configuration schema (Linux only)
- * Allows specifying custom paths to seccomp binaries
  */
 export const SeccompConfigSchema = z.object({
-  bpfPath: z
-    .string()
-    .optional()
-    .describe('Path to the unix-block.bpf filter file'),
   applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
 })
 

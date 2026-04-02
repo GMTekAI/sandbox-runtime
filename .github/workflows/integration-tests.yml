@@ -70,6 +70,10 @@ jobs:
       - name: Install Node dependencies
         run: npm install
 
+      - name: Build seccomp binaries (Linux)
+        if: matrix.os == 'linux'
+        run: npm run build:seccomp
+
       - name: Build project
         run: npm run build
 

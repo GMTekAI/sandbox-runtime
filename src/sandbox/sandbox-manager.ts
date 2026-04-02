@@ -528,9 +528,7 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
-function getSeccompConfig():
-  | { bpfPath?: string; applyPath?: string }
-  | undefined {
+function getSeccompConfig(): { applyPath?: string } | undefined {
   return config?.seccomp
 }
 

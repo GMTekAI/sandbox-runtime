@@ -13,15 +13,14 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "[ -d vendor ] && cp -r vendor dist/ || true",
-    "build:seccomp": "scripts/build-seccomp-binaries.sh",
+    "build:seccomp": "bun vendor/seccomp/build.ts",
     "clean": "rm -rf dist",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
-    "prepublishOnly": "npm run clean && npm run build",
+    "prepublishOnly": "npm run clean && npm run build && cp -r vendor dist/",
     "prepare": "husky"
   },
   "dependencies": {

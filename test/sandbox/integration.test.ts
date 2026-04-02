@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
-import { generateSeccompFilter } from '../../src/sandbox/generate-seccomp-filter.js'
+import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
 
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
@@ -37,16 +37,16 @@ function createTestConfig(testDir: string): SandboxRuntimeConfig {
 // ============================================================================
 
 /**
- * Assert that the sandbox is using pre-generated BPF files from vendor/
+ * Assert that the built apply-seccomp binary is available from vendor/seccomp/.
  */
 function assertPrecompiledBpfInUse(): void {
-  const bpfPath = generateSeccompFilter()
+  const binary = getApplySeccompBinaryPath()
 
-  expect(bpfPath).toBeTruthy()
-  expect(bpfPath).toContain('/vendor/seccomp/')
-  expect(existsSync(bpfPath!)).toBe(true)
+  expect(binary).toBeTruthy()
+  expect(binary).toContain('/vendor/seccomp/')
+  expect(existsSync(binary!)).toBe(true)
 
-  console.log(`✓ Verified using pre-compiled BPF: ${bpfPath}`)
+  console.log(`✓ Verified apply-seccomp binary: ${binary}`)
 }
 
 // ============================================================================

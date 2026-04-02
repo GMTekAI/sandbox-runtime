@@ -1,9 +1,9 @@
 /*
  * apply-seccomp.c - Apply seccomp BPF filter in an isolated PID namespace
  *
- * Usage: apply-seccomp <filter.bpf> <command> [args...]
+ * Usage: apply-seccomp <command> [args...]
  *
- * This program reads a pre-compiled BPF filter from a file, isolates the
+ * This program applies a baked-in seccomp BPF filter, isolates the
  * target command in a nested user+PID+mount namespace so it cannot see or
  * ptrace any process that lacks the filter, applies the filter with
  * prctl(PR_SET_SECCOMP), and execs the command.
@@ -45,6 +45,8 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 
+#include "unix-block-bpf.h"
+
 #ifndef PR_SET_NO_NEW_PRIVS
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
@@ -57,8 +59,6 @@
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
 #endif
-
-#define MAX_FILTER_SIZE 4096
 
 static void die(const char *msg) {
     perror(msg);
@@ -144,29 +144,18 @@ static int reap_until(pid_t main_child) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <filter.bpf> <command> [args...]\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         return 1;
     }
 
-    const char *filter_path = argv[1];
-    char **command_argv = &argv[2];
+    char **command_argv = &argv[1];
 
-    /* ---- Load the BPF filter up front so we fail before any namespace work. ---- */
-    int fd = open(filter_path, O_RDONLY);
-    if (fd < 0) {
-        die("apply-seccomp: open(filter)");
-    }
-    static unsigned char filter_bytes[MAX_FILTER_SIZE];
-    ssize_t filter_size = read(fd, filter_bytes, MAX_FILTER_SIZE);
-    close(fd);
-    if (filter_size <= 0 || filter_size % 8 != 0) {
-        fprintf(stderr, "apply-seccomp: invalid BPF filter (size=%zd)\n", filter_size);
-        return 1;
-    }
+    _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "BPF filter size must be a multiple of sock_filter");
     struct sock_fprog prog = {
-        .len = (unsigned short)(filter_size / 8),
-        .filter = (struct sock_filter *)filter_bytes,
+        .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
+        .filter = (struct sock_filter *)unix_block_bpf,
     };
 
     /* ---- New PID + mount namespaces. Children (not us) enter the PID ns. ----

@@ -20,12 +20,7 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import {
-  generateSeccompFilter,
-  cleanupSeccompFilter,
-  getPreGeneratedBpfPath,
-  getApplySeccompBinaryPath,
-} from './generate-seccomp-filter.js'
+import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -54,7 +49,7 @@ export interface LinuxSandboxParams {
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
   /** Custom seccomp binary paths */
-  seccompConfig?: { bpfPath?: string; applyPath?: string }
+  seccompConfig?: { applyPath?: string }
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -281,9 +276,6 @@ async function linuxGetMandatoryDenyPaths(
   return [...new Set(denyPaths)]
 }
 
-// Track generated seccomp filters for cleanup on process exit
-const generatedSeccompFilters: Set<string> = new Set()
-
 // Track mount points created by bwrap for non-existent deny paths.
 // When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
 // file on the host as a mount point. These persist after bwrap exits and must
@@ -300,7 +292,7 @@ let activeSandboxCount = 0
 let exitHandlerRegistered = false
 
 /**
- * Register cleanup handler for generated seccomp filters and bwrap mount points
+ * Register cleanup handler for bwrap mount points
  */
 function registerExitCleanupHandler(): void {
   if (exitHandlerRegistered) {
@@ -308,13 +300,6 @@ function registerExitCleanupHandler(): void {
   }
 
   process.on('exit', () => {
-    for (const filterPath of generatedSeccompFilters) {
-      try {
-        cleanupSeccompFilter(filterPath)
-      } catch {
-        // Ignore cleanup errors during exit
-      }
-    }
     cleanupBwrapMountPoints({ force: true })
   })
 
@@ -391,7 +376,6 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
 export type LinuxDependencyStatus = {
   hasBwrap: boolean
   hasSocat: boolean
-  hasSeccompBpf: boolean
   hasSeccompApply: boolean
 }
 
@@ -407,13 +391,11 @@ export type SandboxDependencyCheck = {
  * Get detailed status of Linux sandbox dependencies
  */
 export function getLinuxDependencyStatus(seccompConfig?: {
-  bpfPath?: string
   applyPath?: string
 }): LinuxDependencyStatus {
   return {
     hasBwrap: whichSync('bwrap') !== null,
     hasSocat: whichSync('socat') !== null,
-    hasSeccompBpf: getPreGeneratedBpfPath(seccompConfig?.bpfPath) !== null,
     hasSeccompApply:
       getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
   }
@@ -423,7 +405,6 @@ export function getLinuxDependencyStatus(seccompConfig?: {
  * Check sandbox dependencies and return structured result
  */
 export function checkLinuxDependencies(seccompConfig?: {
-  bpfPath?: string
   applyPath?: string
 }): SandboxDependencyCheck {
   const errors: string[] = []
@@ -433,9 +414,7 @@ export function checkLinuxDependencies(seccompConfig?: {
     errors.push('bubblewrap (bwrap) not installed')
   if (whichSync('socat') === null) errors.push('socat not installed')
 
-  const hasBpf = getPreGeneratedBpfPath(seccompConfig?.bpfPath) !== null
-  const hasApply = getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null
-  if (!hasBpf || !hasApply) {
+  if (getApplySeccompBinaryPath(seccompConfig?.applyPath) === null) {
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
@@ -604,9 +583,8 @@ function buildSandboxCommand(
   httpSocketPath: string,
   socksSocketPath: string,
   userCommand: string,
-  seccompFilterPath: string | undefined,
+  applySeccompBinary: string | undefined,
   shell?: string,
-  applySeccompPath?: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -616,44 +594,21 @@ function buildSandboxCommand(
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
-  // If seccomp filter is provided, use apply-seccomp to apply it
-  if (seccompFilterPath) {
-    // apply-seccomp approach:
-    // 1. Outer bwrap/bash: starts socat processes (can use Unix sockets)
-    // 2. apply-seccomp: applies seccomp filter and execs user command
-    // 3. User command runs with seccomp active (Unix sockets blocked)
-    //
-    // apply-seccomp is a simple C program that:
-    // - Sets PR_SET_NO_NEW_PRIVS
-    // - Applies the seccomp BPF filter via prctl(PR_SET_SECCOMP)
-    // - Execs the user command
-    //
-    // This is simpler and more portable than nested bwrap, with no FD redirects needed.
-    const applySeccompBinary = getApplySeccompBinaryPath(applySeccompPath)
-    if (!applySeccompBinary) {
-      throw new Error(
-        'apply-seccomp binary not found. This should have been caught earlier. ' +
-          'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-      )
-    }
-
+  // apply-seccomp runs after socat so socat can still create Unix sockets.
+  if (applySeccompBinary) {
     const applySeccompCmd = shellquote.quote([
       applySeccompBinary,
-      seccompFilterPath,
       shellPath,
       '-c',
       userCommand,
     ])
-
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   } else {
-    // No seccomp filter - run user command directly
     const innerScript = [
       ...socatCommands,
       `eval ${shellquote.quote([userCommand])}`,
     ].join('\n')
-
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   }
 }
@@ -1081,40 +1036,25 @@ export async function wrapCommandWithSandboxLinux(
   activeSandboxCount++
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
-  let seccompFilterPath: string | undefined = undefined
+  let applySeccompBinary: string | undefined
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
-    // Use bwrap's --seccomp flag to apply BPF filter that blocks Unix socket creation
-    //
-    // NOTE: Seccomp filtering is only enabled when allowAllUnixSockets is false
-    // (when true, Unix sockets are allowed)
+    // apply-seccomp wraps the workload and applies the baked-in BPF filter
+    // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
-      seccompFilterPath =
-        generateSeccompFilter(seccompConfig?.bpfPath) ?? undefined
-      const applySeccompBinary = getApplySeccompBinaryPath(
-        seccompConfig?.applyPath,
-      )
+      applySeccompBinary =
+        getApplySeccompBinaryPath(seccompConfig?.applyPath) ?? undefined
 
-      if (!seccompFilterPath || !applySeccompBinary) {
-        // Seccomp binaries not found - warn but continue without unix socket blocking
+      if (!applySeccompBinary) {
         logForDebugging(
-          '[Sandbox Linux] Seccomp binaries not available - unix socket blocking disabled. ' +
+          '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
-        // Clear the filter path so we don't try to use it
-        seccompFilterPath = undefined
       } else {
-        // Track filter for cleanup and register exit handler
-        // Only track runtime-generated filters (not pre-generated ones from vendor/)
-        if (!seccompFilterPath.includes('/vendor/seccomp/')) {
-          generatedSeccompFilters.add(seccompFilterPath)
-          registerExitCleanupHandler()
-        }
-
         logForDebugging(
-          '[Sandbox Linux] Generated seccomp BPF filter for Unix socket blocking',
+          '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
       }
     } else {
@@ -1240,36 +1180,21 @@ export async function wrapCommandWithSandboxLinux(
     }
     bwrapArgs.push('--', shell, '-c')
 
-    // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
-    // Otherwise, just run the command directly with apply-seccomp if needed
+    // With network restrictions, route the command through buildSandboxCommand
+    // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
+    // directly if we have a binary.
     if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
-      // This allows socat to start before seccomp is applied
       const sandboxCommand = buildSandboxCommand(
         httpSocketPath,
         socksSocketPath,
         command,
-        seccompFilterPath,
+        applySeccompBinary,
         shell,
-        seccompConfig?.applyPath,
       )
       bwrapArgs.push(sandboxCommand)
-    } else if (seccompFilterPath) {
-      // No network restrictions but we have seccomp - use apply-seccomp directly
-      // apply-seccomp is a simple C program that applies the seccomp filter and execs the command
-      const applySeccompBinary = getApplySeccompBinaryPath(
-        seccompConfig?.applyPath,
-      )
-      if (!applySeccompBinary) {
-        throw new Error(
-          'apply-seccomp binary not found. This should have been caught earlier. ' +
-            'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-        )
-      }
-
+    } else if (applySeccompBinary) {
       const applySeccompCmd = shellquote.quote([
         applySeccompBinary,
-        seccompFilterPath,
         shell,
         '-c',
         command,
@@ -1279,14 +1204,13 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    // Build the outer bwrap command
     const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
-    if (seccompFilterPath) restrictions.push('seccomp(unix-block)')
+    if (applySeccompBinary) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
@@ -1299,19 +1223,6 @@ export async function wrapCommandWithSandboxLinux(
     if (activeSandboxCount > 0) {
       activeSandboxCount--
     }
-    // Clean up seccomp filter on error
-    if (seccompFilterPath && !seccompFilterPath.includes('/vendor/seccomp/')) {
-      generatedSeccompFilters.delete(seccompFilterPath)
-      try {
-        cleanupSeccompFilter(seccompFilterPath)
-      } catch (cleanupError) {
-        logForDebugging(
-          `[Sandbox Linux] Failed to clean up seccomp filter on error: ${cleanupError}`,
-          { level: 'error' },
-        )
-      }
-    }
-    // Re-throw the original error
     throw error
   }
 }
