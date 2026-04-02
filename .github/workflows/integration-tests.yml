@@ -126,12 +126,13 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
               curl -fsSL https://bun.sh/install | bash
               export PATH="$HOME/.bun/bin:$PATH"
               curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
               apt-get install -y -qq nodejs
               npm ci
+              npm run build:seccomp
               npm run build
               bun test test/docker-weak-sandbox.test.ts
             '
