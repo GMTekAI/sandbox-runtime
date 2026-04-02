@@ -866,3 +866,43 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
     }
   })
 })
+
+describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
+  it('should emit global-name and global-name-prefix rules for configured services', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachLookup: [
+        'com.apple.CoreSimulator.CoreSimulatorService',
+        '2BUA8C4S2C.com.1password.*',
+      ],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(
+      '(allow mach-lookup (global-name \\"com.apple.CoreSimulator.CoreSimulatorService\\"))',
+    )
+    expect(wrappedCommand).toContain(
+      '(allow mach-lookup (global-name-prefix \\"2BUA8C4S2C.com.1password.\\"))',
+    )
+  })
+
+  it('should emit a syntactically valid profile with allowMachLookup set', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachLookup: ['com.example.service', 'com.example.prefix.*', '*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+  })
+})

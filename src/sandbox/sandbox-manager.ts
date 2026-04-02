@@ -504,6 +504,10 @@ function getAllowLocalBinding(): boolean | undefined {
   return config?.network?.allowLocalBinding
 }
 
+function getAllowMachLookup(): string[] | undefined {
+  return config?.network?.allowMachLookup
+}
+
 function getIgnoreViolations(): Record<string, string[]> | undefined {
   return config?.ignoreViolations
 }
@@ -671,6 +675,7 @@ async function wrapWithSandbox(
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
+        allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
@@ -1006,6 +1011,7 @@ export interface ISandboxManager {
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
   getAllowUnixSockets(): string[] | undefined
   getAllowLocalBinding(): boolean | undefined
+  getAllowMachLookup(): string[] | undefined
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
@@ -1046,6 +1052,7 @@ export const SandboxManager: ISandboxManager = {
   getNetworkRestrictionConfig,
   getAllowUnixSockets,
   getAllowLocalBinding,
+  getAllowMachLookup,
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,

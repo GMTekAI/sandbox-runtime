@@ -28,6 +28,7 @@ export interface MacOSSandboxParams {
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowMachLookup?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
@@ -401,6 +402,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowMachLookup,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -414,6 +416,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -458,6 +461,16 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
+        ]
+      : []),
+    ...(allowMachLookup && allowMachLookup.length > 0
+      ? [
+          '; User-specified XPC/Mach services',
+          ...allowMachLookup.map(name =>
+            name.endsWith('*')
+              ? `(allow mach-lookup (global-name-prefix ${escapePath(name.slice(0, -1))}))`
+              : `(allow mach-lookup (global-name ${escapePath(name)}))`,
+          ),
         ]
       : []),
     '',
@@ -699,6 +712,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowMachLookup,
     readConfig,
     writeConfig,
     allowPty,
@@ -733,6 +747,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowMachLookup,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,

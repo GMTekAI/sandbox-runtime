@@ -122,6 +122,23 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
+  allowMachLookup: z
+    .array(
+      z.string().refine(
+        val => {
+          const prefix = val.endsWith('*') ? val.slice(0, -1) : val
+          return !prefix.includes('*')
+        },
+        {
+          message:
+            'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
+        },
+      ),
+    )
+    .optional()
+    .describe(
+      'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
+    ),
   httpProxyPort: z
     .number()
     .int()
