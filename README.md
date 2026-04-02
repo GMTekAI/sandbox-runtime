@@ -577,9 +577,9 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **How it works:**
 
-1. **Pre-generated BPF filters**: The package includes pre-compiled BPF filters for different architectures (x64, ARM64). These are ~104 bytes each and stored in `vendor/seccomp/`. The filters are architecture-specific but libc-independent, so they work with both glibc and musl.
+1. **Baked-in BPF filter**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filter compiled in. The filter is architecture-specific but libc-independent, so the binary works with both glibc and musl.
 
-2. **Runtime detection**: The sandbox automatically detects your system's architecture and loads the appropriate pre-generated BPF filter.
+2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
 
 3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
 

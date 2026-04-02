@@ -270,33 +270,6 @@ describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
     ])
     expect(r.status).toBe(0)
   })
-
-  // ------------------------------------------------------------------
-  // Fail-closed: namespace setup failures must abort
-  // ------------------------------------------------------------------
-
-  it('fails closed when the BPF filter is missing', () => {
-    const r = spawnSync(
-      applySeccomp!,
-      ['/nonexistent/filter.bpf', 'echo', 'x'],
-      {
-        stdio: 'pipe',
-        timeout: 5000,
-      },
-    )
-    expect(r.status).not.toBe(0)
-    expect(r.stdout?.toString() ?? '').not.toContain('x')
-  })
-
-  it('fails closed when the BPF filter is malformed', () => {
-    // /etc/hostname is not a multiple of 8 bytes and not a valid BPF program.
-    const r = spawnSync(applySeccomp!, ['/etc/hostname', 'echo', 'leaked'], {
-      stdio: 'pipe',
-      timeout: 5000,
-    })
-    expect(r.status).not.toBe(0)
-    expect(r.stdout?.toString() ?? '').not.toContain('leaked')
-  })
 })
 
 describe.if(isLinux)(
