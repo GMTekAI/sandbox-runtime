@@ -209,6 +209,17 @@ export const RipgrepConfigSchema = z.object({
  */
 export const SeccompConfigSchema = z.object({
   applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+  argv0: z
+    .string()
+    .optional()
+    .describe(
+      'Invoke apply-seccomp as a multicall binary that dispatches on the ' +
+        'ARGV0 environment variable. When set, applyPath is used verbatim ' +
+        '(no existence check) and the invocation inside bwrap is prefixed ' +
+        'with ARGV0=<this value>. The caller is responsible for ensuring ' +
+        'applyPath resolves inside the bwrap namespace and that the target ' +
+        'binary implements the apply-seccomp interface when ARGV0 matches.',
+    ),
 })
 
 /**

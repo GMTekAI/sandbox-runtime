@@ -82,4 +82,44 @@ describe.if(isLinux)('Sandbox Integration', () => {
 
     expect(wrappedCommand).toContain(real)
   })
+
+  it('argv0 mode: builds ARGV0 prefix and uses applyPath verbatim', async () => {
+    if (checkLinuxDependencies().errors.length > 0) return
+
+    const wrappedCommand = await wrapCommandWithSandboxLinux({
+      command: 'echo test',
+      needsNetworkRestriction: false,
+      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      seccompConfig: { argv0: 'apply-seccomp', applyPath: '/proc/self/fd/3' },
+    })
+
+    expect(wrappedCommand).toContain('ARGV0=apply-seccomp /proc/self/fd/3 ')
+    expect(wrappedCommand).not.toContain('vendor/seccomp')
+  })
+
+  it('argv0 mode: shell-quotes argv0 and applyPath', async () => {
+    if (checkLinuxDependencies().errors.length > 0) return
+
+    const wrappedCommand = await wrapCommandWithSandboxLinux({
+      command: 'echo test',
+      needsNetworkRestriction: false,
+      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      seccompConfig: { argv0: 'x; rm -rf /', applyPath: '/path with space' },
+    })
+
+    expect(wrappedCommand).toContain("ARGV0='x; rm -rf /' '/path with space' ")
+  })
+
+  it('argv0 mode: rejects argv0 without applyPath', () => {
+    if (checkLinuxDependencies().errors.length > 0) return
+
+    expect(
+      wrapCommandWithSandboxLinux({
+        command: 'echo test',
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        seccompConfig: { argv0: 'apply-seccomp' },
+      }),
+    ).rejects.toThrow('seccompConfig.argv0 requires seccompConfig.applyPath')
+  })
 })

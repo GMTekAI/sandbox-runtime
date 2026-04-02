@@ -81,6 +81,18 @@ describe('checkLinuxDependencies', () => {
 
     expect(applySpy).toHaveBeenCalledWith('/custom/apply')
   })
+
+  test('argv0 mode: no seccomp warning even when binary lookup would fail', () => {
+    applySpy.mockReturnValue(null)
+
+    const result = checkLinuxDependencies({
+      argv0: 'apply-seccomp',
+      applyPath: '/proc/self/fd/3',
+    })
+
+    expect(result.warnings).toEqual([])
+    expect(applySpy).not.toHaveBeenCalled()
+  })
 })
 
 describe('getLinuxDependencyStatus', () => {
@@ -122,5 +134,17 @@ describe('getLinuxDependencyStatus', () => {
     expect(status.hasSeccompApply).toBe(false)
     expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)
+  })
+
+  test('argv0 mode: hasSeccompApply is true without touching disk', () => {
+    applySpy.mockReturnValue(null)
+
+    const status = getLinuxDependencyStatus({
+      argv0: 'apply-seccomp',
+      applyPath: '/does/not/exist',
+    })
+
+    expect(status.hasSeccompApply).toBe(true)
+    expect(applySpy).not.toHaveBeenCalled()
   })
 })

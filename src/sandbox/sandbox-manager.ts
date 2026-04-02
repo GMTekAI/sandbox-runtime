@@ -6,7 +6,7 @@ import { whichSync } from '../utils/which.js'
 import { cloneDeep } from 'lodash-es'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import type { SandboxRuntimeConfig } from './sandbox-config.js'
+import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
@@ -528,7 +528,7 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
-function getSeccompConfig(): { applyPath?: string } | undefined {
+function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
 

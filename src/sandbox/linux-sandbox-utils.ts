@@ -21,6 +21,7 @@ import type {
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
+import type { SeccompConfig } from './sandbox-config.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -49,7 +50,7 @@ export interface LinuxSandboxParams {
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
   /** Custom seccomp binary paths */
-  seccompConfig?: { applyPath?: string }
+  seccompConfig?: SeccompConfig
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -390,23 +391,26 @@ export type SandboxDependencyCheck = {
 /**
  * Get detailed status of Linux sandbox dependencies
  */
-export function getLinuxDependencyStatus(seccompConfig?: {
-  applyPath?: string
-}): LinuxDependencyStatus {
+export function getLinuxDependencyStatus(
+  seccompConfig?: SeccompConfig,
+): LinuxDependencyStatus {
+  // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
+  // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
     hasBwrap: whichSync('bwrap') !== null,
     hasSocat: whichSync('socat') !== null,
-    hasSeccompApply:
-      getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
+    hasSeccompApply: seccompConfig?.argv0
+      ? true
+      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
   }
 }
 
 /**
  * Check sandbox dependencies and return structured result
  */
-export function checkLinuxDependencies(seccompConfig?: {
-  applyPath?: string
-}): SandboxDependencyCheck {
+export function checkLinuxDependencies(
+  seccompConfig?: SeccompConfig,
+): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
 
@@ -414,7 +418,10 @@ export function checkLinuxDependencies(seccompConfig?: {
     errors.push('bubblewrap (bwrap) not installed')
   if (whichSync('socat') === null) errors.push('socat not installed')
 
-  if (getApplySeccompBinaryPath(seccompConfig?.applyPath) === null) {
+  if (
+    !seccompConfig?.argv0 &&
+    getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
+  ) {
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
@@ -576,6 +583,31 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
+ * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
+ * multicall-binary prefix that dispatches on the ARGV0 env var.
+ *
+ * Returns a shell-ready string ending in a trailing space — callers append
+ * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
+ * unavailable (no argv0, no binary found).
+ *
+ * When argv0 is set, applyPath is used verbatim (no existence check); the
+ * caller is responsible for ensuring it resolves inside the bwrap namespace.
+ */
+function resolveApplySeccompPrefix(
+  applyPath: string | undefined,
+  argv0: string | undefined,
+): string | undefined {
+  if (argv0) {
+    if (!applyPath) {
+      throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
+    }
+    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+  }
+  const binary = getApplySeccompBinaryPath(applyPath)
+  return binary ? `${shellquote.quote([binary])} ` : undefined
+}
+
+/**
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
@@ -583,7 +615,7 @@ function buildSandboxCommand(
   httpSocketPath: string,
   socksSocketPath: string,
   userCommand: string,
-  applySeccompBinary: string | undefined,
+  applySeccompPrefix: string | undefined,
   shell?: string,
 ): string {
   // Default to bash for backward compatibility
@@ -595,13 +627,9 @@ function buildSandboxCommand(
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
-  if (applySeccompBinary) {
-    const applySeccompCmd = shellquote.quote([
-      applySeccompBinary,
-      shellPath,
-      '-c',
-      userCommand,
-    ])
+  if (applySeccompPrefix) {
+    const applySeccompCmd =
+      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   } else {
@@ -1036,17 +1064,19 @@ export async function wrapCommandWithSandboxLinux(
   activeSandboxCount++
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
-  let applySeccompBinary: string | undefined
+  let applySeccompPrefix: string | undefined
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
-      applySeccompBinary =
-        getApplySeccompBinaryPath(seccompConfig?.applyPath) ?? undefined
+      applySeccompPrefix = resolveApplySeccompPrefix(
+        seccompConfig?.applyPath,
+        seccompConfig?.argv0,
+      )
 
-      if (!applySeccompBinary) {
+      if (!applySeccompPrefix) {
         logForDebugging(
           '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
@@ -1188,17 +1218,13 @@ export async function wrapCommandWithSandboxLinux(
         httpSocketPath,
         socksSocketPath,
         command,
-        applySeccompBinary,
+        applySeccompPrefix,
         shell,
       )
       bwrapArgs.push(sandboxCommand)
-    } else if (applySeccompBinary) {
-      const applySeccompCmd = shellquote.quote([
-        applySeccompBinary,
-        shell,
-        '-c',
-        command,
-      ])
+    } else if (applySeccompPrefix) {
+      const applySeccompCmd =
+        applySeccompPrefix + shellquote.quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
       bwrapArgs.push(command)
@@ -1210,7 +1236,7 @@ export async function wrapCommandWithSandboxLinux(
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
-    if (applySeccompBinary) restrictions.push('seccomp(unix-block)')
+    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
