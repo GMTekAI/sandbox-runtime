@@ -3,7 +3,6 @@ import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
-import { cloneDeep } from 'lodash-es'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
@@ -734,7 +733,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // Deep clone the config to avoid mutations
-  config = cloneDeep(newConfig)
+  config = structuredClone(newConfig)
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
