@@ -653,6 +653,113 @@ describe.if(isMacOS)('macOS Seatbelt Write Bypass Prevention', () => {
 })
 
 /**
+ * Tests for Seatbelt symlink-creation bypass on protected ancestors.
+ *
+ * Issue: generateMoveBlockingRules() emitted (deny file-write-unlink) for
+ * protected paths and their ancestor directories, but not file-write-create.
+ * If a protected path's ancestor directory did not yet exist, a sandboxed
+ * command could create it as a symlink pointing at attacker-controlled content,
+ * since (allow file-write* (subpath <cwd>)) is not overridden by a
+ * file-write-unlink-only deny on the ancestor literal.
+ *
+ * Fix: Emit (deny file-write-create ...) alongside every (deny file-write-unlink ...)
+ * in generateMoveBlockingRules(), and re-allow it for write-allowed paths in
+ * generateReadRules() to preserve normal file creation in the project directory.
+ */
+describe.if(isMacOS)(
+  'macOS Seatbelt Symlink Creation Bypass Prevention',
+  () => {
+    const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-create-test-' + Date.now())
+    const TEST_ALLOWED_DIR = join(TEST_BASE_DIR, 'allowed')
+    // Protected file whose parent (.claude) does NOT exist on disk
+    const TEST_DENIED_FILE = join(TEST_ALLOWED_DIR, '.claude', 'settings.json')
+    const TEST_DENIED_PARENT = join(TEST_ALLOWED_DIR, '.claude')
+    const TEST_DECOY_DIR = join(TEST_ALLOWED_DIR, 'decoy')
+
+    beforeAll(() => {
+      mkdirSync(TEST_ALLOWED_DIR, { recursive: true })
+      mkdirSync(TEST_DECOY_DIR, { recursive: true })
+      writeFileSync(join(TEST_DECOY_DIR, 'settings.json'), '{"evil":true}')
+    })
+
+    afterAll(() => {
+      if (existsSync(TEST_BASE_DIR)) {
+        rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+      }
+    })
+
+    it('should emit file-write-create deny rules for protected ancestors', () => {
+      const writeConfig: FsWriteRestrictionConfig = {
+        allowOnly: [TEST_ALLOWED_DIR],
+        denyWithinAllow: [TEST_DENIED_FILE],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig,
+      })
+
+      expect(wrappedCommand).toContain('deny file-write-create')
+      expect(wrappedCommand).toContain('deny file-write-unlink')
+    })
+
+    it('should block creating a symlink at a non-existent protected ancestor', () => {
+      const writeConfig: FsWriteRestrictionConfig = {
+        allowOnly: [TEST_ALLOWED_DIR],
+        denyWithinAllow: [TEST_DENIED_FILE],
+      }
+
+      expect(existsSync(TEST_DENIED_PARENT)).toBe(false)
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `ln -s ${TEST_DECOY_DIR} ${TEST_DENIED_PARENT}`,
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).not.toBe(0)
+      const output = (result.stderr || '').toLowerCase()
+      expect(output).toContain('operation not permitted')
+      expect(existsSync(TEST_DENIED_PARENT)).toBe(false)
+    })
+
+    it('should still allow creating ordinary files in the write-allowed directory', () => {
+      const writeConfig: FsWriteRestrictionConfig = {
+        allowOnly: [TEST_ALLOWED_DIR],
+        denyWithinAllow: [TEST_DENIED_FILE],
+      }
+
+      const newFile = join(TEST_ALLOWED_DIR, 'ordinary.txt')
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `echo hello > ${newFile}`,
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(existsSync(newFile)).toBe(true)
+      expect(readFileSync(newFile, 'utf8').trim()).toBe('hello')
+    })
+  },
+)
+
+/**
  * Tests for Unix domain socket support in network-restricted sandbox.
  *
  * Issue: When allowedDomains is set, the sandbox enters restricted network mode.

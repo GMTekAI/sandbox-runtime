@@ -116,8 +116,11 @@ function getAncestorDirectories(pathStr: string): string[] {
 }
 
 /**
- * Generate deny rules for file movement (file-write-unlink) to protect paths
- * This prevents bypassing read or write restrictions by moving files/directories
+ * Generate deny rules for file movement (file-write-unlink) and creation
+ * (file-write-create) to protect paths. This prevents bypassing read or write
+ * restrictions by moving files/directories, and prevents replacing a
+ * not-yet-existing protected path (or one of its ancestors) with an
+ * attacker-controlled symlink.
  *
  * @param pathPatterns - Array of path patterns to protect (can include globs)
  * @param logTag - Log tag for sandbox violations
@@ -128,6 +131,7 @@ function generateMoveBlockingRules(
   logTag: string,
 ): string[] {
   const rules: string[] = []
+  const ops = ['file-write-unlink', 'file-write-create'] as const
 
   for (const pathPattern of pathPatterns) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
@@ -137,11 +141,13 @@ function generateMoveBlockingRules(
       const regexPattern = globToRegex(normalizedPath)
 
       // Block moving/renaming files matching this pattern
-      rules.push(
-        `(deny file-write-unlink`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
+      for (const op of ops) {
+        rules.push(
+          `(deny ${op}`,
+          `  (regex ${escapePath(regexPattern)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
 
       // For glob patterns, extract the static prefix and block ancestor moves
       // Remove glob characters to get the directory prefix
@@ -153,38 +159,46 @@ function generateMoveBlockingRules(
           : path.dirname(staticPrefix)
 
         // Block moves of the base directory itself
-        rules.push(
-          `(deny file-write-unlink`,
-          `  (literal ${escapePath(baseDir)})`,
-          `  (with message "${logTag}"))`,
-        )
+        for (const op of ops) {
+          rules.push(
+            `(deny ${op}`,
+            `  (literal ${escapePath(baseDir)})`,
+            `  (with message "${logTag}"))`,
+          )
+        }
 
         // Block moves of ancestor directories
         for (const ancestorDir of getAncestorDirectories(baseDir)) {
-          rules.push(
-            `(deny file-write-unlink`,
-            `  (literal ${escapePath(ancestorDir)})`,
-            `  (with message "${logTag}"))`,
-          )
+          for (const op of ops) {
+            rules.push(
+              `(deny ${op}`,
+              `  (literal ${escapePath(ancestorDir)})`,
+              `  (with message "${logTag}"))`,
+            )
+          }
         }
       }
     } else {
       // Use subpath matching for literal paths
 
       // Block moving/renaming the denied path itself
-      rules.push(
-        `(deny file-write-unlink`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
+      for (const op of ops) {
+        rules.push(
+          `(deny ${op}`,
+          `  (subpath ${escapePath(normalizedPath)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
 
       // Block moves of ancestor directories
       for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-        rules.push(
-          `(deny file-write-unlink`,
-          `  (literal ${escapePath(ancestorDir)})`,
-          `  (with message "${logTag}"))`,
-        )
+        for (const op of ops) {
+          rules.push(
+            `(deny ${op}`,
+            `  (literal ${escapePath(ancestorDir)})`,
+            `  (with message "${logTag}"))`,
+          )
+        }
       }
     }
   }
@@ -284,14 +298,15 @@ function generateReadRules(
   // Block file movement to prevent bypass via mv/rename
   rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
 
-  // Re-allow file-write-unlink for paths that are explicitly write-allowed.
-  // The move-blocking rules above emit broad (deny file-write-unlink (subpath "/Users"))
-  // to prevent bypassing read restrictions by moving files out of denied regions.
+  // Re-allow file-write-unlink / file-write-create for paths that are explicitly
+  // write-allowed. The move-blocking rules above emit broad
+  // (deny file-write-unlink (subpath "/Users")) to prevent bypassing read
+  // restrictions by moving files out of denied regions.
   // However, in macOS Seatbelt, a specific (deny file-write-unlink) is not overridden
   // by a later (allow file-write*) wildcard — the specific operation deny wins.
   // This means file deletions are blocked even in write-allowed directories like
   // the project directory. We fix this by explicitly re-allowing file-write-unlink
-  // for write-allowed paths after the move-blocking deny rules.
+  // and file-write-create for write-allowed paths after the move-blocking deny rules.
   //
   // Note: denyWithinAllow paths are not excluded here because the write section's
   // generateMoveBlockingRules() runs later in the profile and re-denies
@@ -301,19 +316,21 @@ function generateReadRules(
     for (const pathPattern of writeAllowPaths) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
 
-      if (containsGlobChars(normalizedPath)) {
-        const regexPattern = globToRegex(normalizedPath)
-        rules.push(
-          `(allow file-write-unlink`,
-          `  (regex ${escapePath(regexPattern)})`,
-          `  (with message "${logTag}"))`,
-        )
-      } else {
-        rules.push(
-          `(allow file-write-unlink`,
-          `  (subpath ${escapePath(normalizedPath)})`,
-          `  (with message "${logTag}"))`,
-        )
+      for (const op of ['file-write-unlink', 'file-write-create'] as const) {
+        if (containsGlobChars(normalizedPath)) {
+          const regexPattern = globToRegex(normalizedPath)
+          rules.push(
+            `(allow ${op}`,
+            `  (regex ${escapePath(regexPattern)})`,
+            `  (with message "${logTag}"))`,
+          )
+        } else {
+          rules.push(
+            `(allow ${op}`,
+            `  (subpath ${escapePath(normalizedPath)})`,
+            `  (with message "${logTag}"))`,
+          )
+        }
       }
     }
   }
