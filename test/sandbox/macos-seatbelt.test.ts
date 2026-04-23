@@ -6,6 +6,7 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -669,11 +670,17 @@ describe.if(isMacOS)('macOS Seatbelt Write Bypass Prevention', () => {
 describe.if(isMacOS)(
   'macOS Seatbelt Symlink Creation Bypass Prevention',
   () => {
-    const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-create-test-' + Date.now())
+    // Use the canonical tmpdir (/private/var/... on macOS) so the deny rules —
+    // whose paths cannot be realpath-resolved because they don't exist yet —
+    // match the canonical syscall paths Seatbelt evaluates.
+    const TEST_BASE_DIR = join(
+      realpathSync(tmpdir()),
+      'seatbelt-create-test-' + Date.now(),
+    )
     const TEST_ALLOWED_DIR = join(TEST_BASE_DIR, 'allowed')
-    // Protected file whose parent (.claude) does NOT exist on disk
-    const TEST_DENIED_FILE = join(TEST_ALLOWED_DIR, '.claude', 'settings.json')
+    // Protected directory that does NOT exist on disk
     const TEST_DENIED_PARENT = join(TEST_ALLOWED_DIR, '.claude')
+    const TEST_DENIED_FILE = join(TEST_DENIED_PARENT, 'settings.json')
     const TEST_DECOY_DIR = join(TEST_ALLOWED_DIR, 'decoy')
 
     beforeAll(() => {
