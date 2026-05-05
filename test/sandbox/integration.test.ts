@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawn as cpSpawn } from 'node:child_process'
 import {
   existsSync,
   unlinkSync,
@@ -11,61 +10,10 @@ import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
+import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
-
-type RunOpts = {
-  shell?: boolean
-  encoding?: 'utf8'
-  timeout?: number
-  cwd?: string
-}
-type RunResult = {
-  stdout: string
-  stderr: string
-  status: number | null
-  signal: NodeJS.Signals | null
-}
-
-/**
- * Async stand-in for spawnSync. The wrapped commands talk to the in-process
- * HTTP/SOCKS proxy; spawnSync would block this event loop while curl waits
- * for that same proxy to respond, which is a self-deadlock that only ever
- * worked because some bun versions happened to pump the loop during the
- * wait. Mirrors enough of spawnSync's surface for the call sites below.
- */
-async function spawnAsync(
-  cmd: string,
-  argsOrOpts?: readonly string[] | RunOpts,
-  maybeOpts?: RunOpts,
-): Promise<RunResult> {
-  const args = Array.isArray(argsOrOpts) ? argsOrOpts : undefined
-  const opts = (Array.isArray(argsOrOpts) ? maybeOpts : argsOrOpts) ?? {}
-  const child = args
-    ? cpSpawn(cmd, args, { cwd: opts.cwd })
-    : cpSpawn(cmd, { shell: opts.shell ?? true, cwd: opts.cwd })
-
-  let stdout = ''
-  let stderr = ''
-  child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
-  child.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
-
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let signal: NodeJS.Signals | null = null
-  if (opts.timeout) {
-    timer = setTimeout(() => {
-      signal = 'SIGTERM'
-      child.kill('SIGTERM')
-    }, opts.timeout)
-  }
-
-  const status = await new Promise<number | null>(resolve =>
-    child.on('close', code => resolve(code)),
-  )
-  if (timer) clearTimeout(timer)
-  return { stdout, stderr, status, signal }
-}
 
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
