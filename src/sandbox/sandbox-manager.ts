@@ -785,6 +785,28 @@ async function reset(): Promise<void> {
     // Create array to wait for process exits
     const exitPromises: Promise<void>[] = []
 
+    // DIAGNOSTIC (temporary): dump bridge process state so we can see
+    // whether socat actually dies on SIGTERM vs bun losing the 'exit'.
+    const diagDump = (label: string, pid: number | undefined) => {
+      if (!pid) return
+      try {
+        const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8')
+        const state = status.match(/^State:\s+(.+)$/m)?.[1]
+        const sig = status.match(/^SigBlk:\s+(\S+)/m)?.[1]
+        const comm = fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+        console.error(
+          `[reset-diag] ${label} pid=${pid} comm=${comm} state=${state} SigBlk=${sig}`,
+        )
+      } catch (e) {
+        console.error(
+          `[reset-diag] ${label} pid=${pid} /proc gone (${(e as Error).message})`,
+        )
+      }
+    }
+    const t0 = Date.now()
+    diagDump('pre-SIGTERM http', httpBridgeProcess.pid)
+    diagDump('pre-SIGTERM socks', socksBridgeProcess.pid)
+
     // Kill HTTP bridge and wait for it to exit
     if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
       try {
@@ -795,11 +817,17 @@ async function reset(): Promise<void> {
         exitPromises.push(
           new Promise<void>(resolve => {
             httpBridgeProcess.once('exit', () => {
-              logForDebugging('HTTP bridge process exited')
+              console.error(
+                `[reset-diag] http 'exit' fired at +${Date.now() - t0}ms`,
+              )
               resolve()
             })
+            setTimeout(() => {
+              diagDump(`+200ms http`, httpBridgeProcess.pid)
+            }, 200)
             // Timeout after 5 seconds
             setTimeout(() => {
+              diagDump(`+4500ms http`, httpBridgeProcess.pid)
               if (!httpBridgeProcess.killed) {
                 logForDebugging('HTTP bridge did not exit, forcing SIGKILL', {
                   level: 'warn',
@@ -813,7 +841,7 @@ async function reset(): Promise<void> {
                 }
               }
               resolve()
-            }, 5000)
+            }, 4500)
           }),
         )
       } catch (err) {
