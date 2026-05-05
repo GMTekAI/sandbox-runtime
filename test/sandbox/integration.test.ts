@@ -773,83 +773,84 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
       })
 
       it('should enforce wildcard domain pattern matching correctly', async () => {
-        // Reset and reinitialize with wildcard pattern
-        await SandboxManager.reset()
-        await SandboxManager.initialize({
+        // Swap allowedDomains in-place rather than reset()+initialize().
+        // The proxy filter reads the live config on every request, so this
+        // takes effect immediately and lets us keep the bridge/proxy that
+        // every other test in this describe already uses.
+        const baseConfig = createTestConfig(TEST_DIR)
+        SandboxManager.updateConfig({
+          ...baseConfig,
           network: {
+            ...baseConfig.network,
             allowedDomains: ['*.github.com', 'example.com'],
-            deniedDomains: [],
-          },
-          filesystem: {
-            denyRead: [],
-            allowWrite: [],
-            denyWrite: [],
           },
         })
+        try {
+          // Test 1: Subdomain should match wildcard. We only assert the
+          // proxy did NOT block it — the upstream response is irrelevant —
+          // so cap the request tightly.
+          const command1 = await SandboxManager.wrapWithSandbox(
+            'curl -s --connect-timeout 2 --max-time 2 http://api.github.com 2>&1 | head -20',
+          )
 
-        // Test 1: Subdomain should match wildcard
-        const command1 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://api.github.com 2>&1 | head -20',
-        )
+          const result1 = spawnSync(command1, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result1 = spawnSync(command1, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
-        })
+          // Should NOT be blocked - api.github.com matches *.github.com
+          const output1 = result1.stdout.toLowerCase()
+          expect(output1).not.toContain('blocked by network allowlist')
 
-        // Should NOT be blocked - api.github.com matches *.github.com
-        const output1 = result1.stdout.toLowerCase()
-        expect(output1).not.toContain('blocked by network allowlist')
+          // Test 2: Base domain should NOT match wildcard (*.github.com doesn't match github.com)
+          const command2 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 2 http://github.com 2>&1',
+          )
 
-        // Test 2: Base domain should NOT match wildcard (*.github.com doesn't match github.com)
-        const command2 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://github.com 2>&1',
-        )
+          const result2 = spawnSync(command2, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result2 = spawnSync(command2, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
-        })
+          // Should be blocked - github.com does NOT match *.github.com
+          const output2 = result2.stdout.toLowerCase()
+          expect(output2).toContain('blocked by network allowlist')
 
-        // Should be blocked - github.com does NOT match *.github.com
-        const output2 = result2.stdout.toLowerCase()
-        expect(output2).toContain('blocked by network allowlist')
+          // Test 3: Malicious lookalike domain should NOT match
+          const command3 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 2 http://malicious-github.com 2>&1',
+          )
 
-        // Test 3: Malicious lookalike domain should NOT match
-        const command3 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://malicious-github.com 2>&1',
-        )
+          const result3 = spawnSync(command3, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result3 = spawnSync(command3, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
-        })
+          // Should be blocked - malicious-github.com does NOT match *.github.com
+          const output3 = result3.stdout.toLowerCase()
+          expect(output3).toContain('blocked by network allowlist')
 
-        // Should be blocked - malicious-github.com does NOT match *.github.com
-        const output3 = result3.stdout.toLowerCase()
-        expect(output3).toContain('blocked by network allowlist')
+          // Test 4: Multiple subdomains should match
+          const command4 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
+          )
 
-        // Test 4: Multiple subdomains should match
-        const command4 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
-        )
+          const result4 = spawnSync(command4, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 5000,
+          })
 
-        const result4 = spawnSync(command4, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
-        })
-
-        // githubusercontent.com should be blocked (doesn't match *.github.com)
-        const output4 = result4.stdout.toLowerCase()
-        expect(output4).toContain('blocked by network allowlist')
-
-        // Restore original config
-        await SandboxManager.reset()
-        await SandboxManager.initialize(createTestConfig(TEST_DIR))
+          // githubusercontent.com should be blocked (doesn't match *.github.com)
+          const output4 = result4.stdout.toLowerCase()
+          expect(output4).toContain('blocked by network allowlist')
+        } finally {
+          // Restore the suite's default allowlist for subsequent tests.
+          SandboxManager.updateConfig(baseConfig)
+        }
       })
 
       it('should prevent creation of special file types that could bypass restrictions', async () => {
