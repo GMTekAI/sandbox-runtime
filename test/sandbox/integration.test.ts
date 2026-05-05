@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn as cpSpawn } from 'node:child_process'
 import {
   existsSync,
   unlinkSync,
@@ -14,6 +14,58 @@ import { isLinux } from '../helpers/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
+
+type RunOpts = {
+  shell?: boolean
+  encoding?: 'utf8'
+  timeout?: number
+  cwd?: string
+}
+type RunResult = {
+  stdout: string
+  stderr: string
+  status: number | null
+  signal: NodeJS.Signals | null
+}
+
+/**
+ * Async stand-in for spawnSync. The wrapped commands talk to the in-process
+ * HTTP/SOCKS proxy; spawnSync would block this event loop while curl waits
+ * for that same proxy to respond, which is a self-deadlock that only ever
+ * worked because some bun versions happened to pump the loop during the
+ * wait. Mirrors enough of spawnSync's surface for the call sites below.
+ */
+async function spawnAsync(
+  cmd: string,
+  argsOrOpts?: readonly string[] | RunOpts,
+  maybeOpts?: RunOpts,
+): Promise<RunResult> {
+  const args = Array.isArray(argsOrOpts) ? argsOrOpts : undefined
+  const opts = (Array.isArray(argsOrOpts) ? maybeOpts : argsOrOpts) ?? {}
+  const child = args
+    ? cpSpawn(cmd, args, { cwd: opts.cwd })
+    : cpSpawn(cmd, { shell: opts.shell ?? true, cwd: opts.cwd })
+
+  let stdout = ''
+  let stderr = ''
+  child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
+  child.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let signal: NodeJS.Signals | null = null
+  if (opts.timeout) {
+    timer = setTimeout(() => {
+      signal = 'SIGTERM'
+      child.kill('SIGTERM')
+    }, opts.timeout)
+  }
+
+  const status = await new Promise<number | null>(resolve =>
+    child.on('close', code => resolve(code)),
+  )
+  if (timer) clearTimeout(timer)
+  return { stdout, stderr, status, signal }
+}
 
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
@@ -131,7 +183,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "Test message" | nc -U ${TEST_SOCKET_PATH}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -154,7 +206,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s http://blocked-domain.example',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -170,7 +222,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 https://www.anthropic.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -194,7 +246,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s http://example.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -220,7 +272,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "should fail" > ${testFile}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -251,7 +303,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "${testContent}" > allowed-write.txt`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -288,7 +340,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'head -n 5 ~/.bashrc',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -324,7 +376,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           allowAllUnixSockets: false, // Enable seccomp
         })
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -360,7 +412,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "Hello from sandbox"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -375,7 +427,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "line1\nline2\nline3" | grep line2',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -390,7 +442,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
     describe('Shell Selection (binShell parameter)', () => {
       it('should execute commands with zsh when binShell is specified', async () => {
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', {
+        const zshCheck = await spawnAsync('which zsh', {
           shell: true,
           encoding: 'utf8',
         })
@@ -405,7 +457,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -418,7 +470,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
 
       it('should use zsh syntax successfully with binShell=zsh', async () => {
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', {
+        const zshCheck = await spawnAsync('which zsh', {
           shell: true,
           encoding: 'utf8',
         })
@@ -433,7 +485,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -449,7 +501,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "Shell: $BASH_VERSION"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -469,7 +521,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'ls /proc | grep -E "^[0-9]+$" | wc -l',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -494,7 +546,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `ln -s ${targetOutside} ${linkInAllowed} 2>&1 && echo "escaped" > ${linkInAllowed} 2>&1`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -531,7 +583,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         const startTime = Date.now()
-        spawnSync(command, {
+        await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -577,11 +629,15 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
 
         // Use timeout to kill the sandbox after 1 second
         // The inner command would take 10 seconds to complete
-        const result = spawnSync('timeout', ['1', 'bash', '-c', command], {
-          encoding: 'utf8',
-          cwd: TEST_DIR,
-          timeout: 5000,
-        })
+        const result = await spawnAsync(
+          'timeout',
+          ['1', 'bash', '-c', command],
+          {
+            encoding: 'utf8',
+            cwd: TEST_DIR,
+            timeout: 5000,
+          },
+        )
 
         // timeout returns 124 when it kills the process
         expect(result.status).toBe(124)
@@ -619,7 +675,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         // Kill after 0.5 seconds
-        spawnSync('timeout', ['0.5', 'bash', '-c', command], {
+        await spawnAsync('timeout', ['0.5', 'bash', '-c', command], {
           encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 3000,
@@ -629,7 +685,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         await new Promise(resolve => setTimeout(resolve, 1500))
 
         // Check for orphan processes with our marker
-        const psResult = spawnSync(
+        const psResult = await spawnAsync(
           'bash',
           ['-c', `ps aux | grep "${uniqueMarker}" | grep -v grep || true`],
           {
@@ -657,7 +713,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `cp /bin/bash ${setuidTest} 2>&1 && chmod u+s ${setuidTest} 2>&1 && ${setuidTest} -c "id -u" 2>&1`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -673,7 +729,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'sudo -n echo "elevated" 2>&1 || su -c "echo elevated" 2>&1 || echo "commands blocked"',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await spawnAsync(command2, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -703,7 +759,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 --connect-timeout 2 https://blocked-domain.example 2>&1 || echo "curl_failed"',
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           timeout: 4000,
@@ -725,7 +781,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 http://blocked-domain.example:8080 2>&1',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await spawnAsync(command2, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -741,7 +797,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --max-time 2 http://1.1.1.1 2>&1', // Cloudflare DNS
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await spawnAsync(command3, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -757,7 +813,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --max-time 5 https://example.com 2>&1',
         )
 
-        const result4 = spawnSync(command4, {
+        const result4 = await spawnAsync(command4, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -793,7 +849,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
             'curl -s --connect-timeout 2 --max-time 2 http://api.github.com 2>&1 | head -20',
           )
 
-          const result1 = spawnSync(command1, {
+          const result1 = await spawnAsync(command1, {
             shell: true,
             encoding: 'utf8',
             timeout: 3000,
@@ -808,7 +864,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
             'curl -s --max-time 2 http://github.com 2>&1',
           )
 
-          const result2 = spawnSync(command2, {
+          const result2 = await spawnAsync(command2, {
             shell: true,
             encoding: 'utf8',
             timeout: 3000,
@@ -823,7 +879,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
             'curl -s --max-time 2 http://malicious-github.com 2>&1',
           )
 
-          const result3 = spawnSync(command3, {
+          const result3 = await spawnAsync(command3, {
             shell: true,
             encoding: 'utf8',
             timeout: 3000,
@@ -838,7 +894,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
             'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
           )
 
-          const result4 = spawnSync(command4, {
+          const result4 = await spawnAsync(command4, {
             shell: true,
             encoding: 'utf8',
             timeout: 5000,
@@ -871,7 +927,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `mkfifo ${fifoPath} && test -p ${fifoPath} && echo "FIFO created"`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -887,7 +943,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "test content" > ${regularFile}`,
         )
 
-        spawnSync(command2a, {
+        await spawnAsync(command2a, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -898,7 +954,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `ln /etc/passwd ${hardlinkPath} 2>&1`,
         )
 
-        const result2b = spawnSync(command2b, {
+        const result2b = await spawnAsync(command2b, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -917,7 +973,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `mknod ${devicePath} c 1 3 2>&1`,
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await spawnAsync(command3, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -996,7 +1052,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 --connect-timeout 2 http://example.com 2>&1 || echo "network_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1030,7 +1086,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 --connect-timeout 2 https://example.com 2>&1 || echo "network_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1058,7 +1114,7 @@ describe.if(isLinux)(
           'host example.com 2>&1 || nslookup example.com 2>&1 || echo "dns_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1084,7 +1140,7 @@ describe.if(isLinux)(
           'wget -q --timeout=2 -O - http://example.com 2>&1 || echo "wget_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1112,7 +1168,7 @@ describe.if(isLinux)(
           `echo "${testContent}" > ${testFile} && cat ${testFile}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -1151,7 +1207,7 @@ describe.if(isLinux)(
           'curl -s --max-time 5 http://example.com 2>&1',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -1167,7 +1223,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 http://anthropic.com 2>&1',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1198,7 +1254,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 http://example.com 2>&1 || echo "blocked"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1258,7 +1314,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
       'echo "$GIT_SSH_COMMAND"',
     )
 
-    const result = spawnSync(command, {
+    const result = await spawnAsync(command, {
       shell: true,
       encoding: 'utf8',
       timeout: 5000,
@@ -1283,7 +1339,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
         'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
     )
 
-    const result = spawnSync(command, {
+    const result = await spawnAsync(command, {
       shell: true,
       encoding: 'utf8',
       timeout: 15000,
