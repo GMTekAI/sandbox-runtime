@@ -824,10 +824,14 @@ async function reset(): Promise<void> {
             })
             setTimeout(() => {
               diagDump(`+200ms http`, httpBridgeProcess.pid)
+              diagDump(`+200ms socks`, socksBridgeProcess.pid)
+              console.error(
+                `[reset-diag] +200ms http exitCode=${httpBridgeProcess.exitCode} signalCode=${httpBridgeProcess.signalCode}`,
+              )
             }, 200)
             // Timeout after 5 seconds
             setTimeout(() => {
-              diagDump(`+4500ms http`, httpBridgeProcess.pid)
+              diagDump(`+5000ms http`, httpBridgeProcess.pid)
               if (!httpBridgeProcess.killed) {
                 logForDebugging('HTTP bridge did not exit, forcing SIGKILL', {
                   level: 'warn',
@@ -841,7 +845,7 @@ async function reset(): Promise<void> {
                 }
               }
               resolve()
-            }, 4500)
+            }, 5000)
           }),
         )
       } catch (err) {
