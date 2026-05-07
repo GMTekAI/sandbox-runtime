@@ -40,7 +40,6 @@ import {
   stripBrackets,
 } from './parent-proxy.js'
 import { isIP } from 'node:net'
-import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
@@ -342,7 +341,6 @@ async function initialize(
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
-          config.socatPath,
         )
       }
 
@@ -789,80 +787,6 @@ function cleanupAfterCommand(): void {
 }
 
 /**
- * How long to wait for a bridge process to exit after SIGTERM before
- * escalating to SIGKILL.
- *
- * socat exits within ~10ms of SIGTERM; this is purely a safety margin.
- * Keep it well below bun's default 5s test/hook timeout: when a bridge's
- * `'exit'` event is missed entirely (a Linux-only Bun pidfd notification
- * bug, oven-sh/bun#30301), this timer is the only thing that lets `reset()`
- * make progress, and a 5000ms value here loses the race against the hook
- * timer by a couple of milliseconds — that race was the dominant CI flake.
- */
-const BRIDGE_EXIT_TIMEOUT_MS = 1500
-
-/**
- * SIGTERM a bridge process and resolve once it has exited.
- *
- * Returns immediately if the process has already exited (`.exitCode` /
- * `.signalCode` set) — registering `.once('exit')` after the event has
- * already been emitted produces a listener that never fires.
- *
- * Falls back to SIGKILL after {@link BRIDGE_EXIT_TIMEOUT_MS}.
- */
-function killBridgeProcess(proc: ChildProcess, label: string): Promise<void> {
-  // Already exited → 'exit' already emitted → a fresh once('exit') would
-  // never fire. Don't wait on it.
-  if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) {
-    return Promise.resolve()
-  }
-
-  try {
-    process.kill(proc.pid, 'SIGTERM')
-    logForDebugging(`Sent SIGTERM to ${label} bridge process`)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-      logForDebugging(`Error killing ${label} bridge: ${err}`, {
-        level: 'error',
-      })
-    }
-    // ESRCH = process already gone; nothing to wait for either way.
-    return Promise.resolve()
-  }
-
-  return new Promise<void>(resolve => {
-    let settled = false
-    const done = () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve()
-    }
-    proc.once('exit', () => {
-      logForDebugging(`${label} bridge process exited`)
-      done()
-    })
-    const timer = setTimeout(() => {
-      // Re-check liveness — the 'exit' may have raced us.
-      if (proc.exitCode === null && proc.signalCode === null) {
-        logForDebugging(`${label} bridge did not exit, forcing SIGKILL`, {
-          level: 'warn',
-        })
-        try {
-          if (proc.pid) process.kill(proc.pid, 'SIGKILL')
-        } catch {
-          // Process may have already exited
-        }
-      }
-      done()
-    }, BRIDGE_EXIT_TIMEOUT_MS)
-    // The bridge process is being torn down; this timer must not be the
-    // only thing keeping the event loop alive.
-    timer.unref?.()
-  })
-}
-
-/**
  * Forcibly close an http.Server, including any in-flight requests.
  *
  * Plain `server.close()` waits for every active request to finish.
@@ -912,41 +836,31 @@ async function reset(): Promise<void> {
   }
 
   if (managerContext?.linuxBridge) {
-    const {
-      httpSocketPath,
-      socksSocketPath,
-      httpBridgeProcess,
-      socksBridgeProcess,
-    } = managerContext.linuxBridge
-
-    // Kill both bridges and wait for them to exit
-    await Promise.all([
-      killBridgeProcess(httpBridgeProcess, 'HTTP'),
-      killBridgeProcess(socksBridgeProcess, 'SOCKS'),
-    ])
-
-    // Clean up sockets
-    if (httpSocketPath) {
+    // The bridges are in-process net.Servers. close() stops accepting new
+    // connections and unlinks the socket file; we don't await it because a
+    // sandbox mid-stream holds its connection open until it exits, and
+    // reset() shouldn't block on that.
+    const { socketDir, httpBridgeServer, socksBridgeServer } =
+      managerContext.linuxBridge
+    for (const [server, label] of [
+      [httpBridgeServer, 'HTTP'],
+      [socksBridgeServer, 'SOCKS'],
+    ] as const) {
       try {
-        fs.rmSync(httpSocketPath, { force: true })
-        logForDebugging('Cleaned up HTTP socket')
+        server.close()
       } catch (err) {
-        logForDebugging(`HTTP socket cleanup error: ${err}`, {
+        logForDebugging(`Error closing ${label} bridge: ${err}`, {
           level: 'error',
         })
       }
     }
-
-    if (socksSocketPath) {
-      try {
-        fs.rmSync(socksSocketPath, { force: true })
-        logForDebugging('Cleaned up SOCKS socket')
-      } catch (err) {
-        logForDebugging(`SOCKS socket cleanup error: ${err}`, {
-          level: 'error',
-        })
-      }
+    // The sockets live in a private mkdtemp directory; remove it whole.
+    try {
+      fs.rmSync(socketDir, { recursive: true, force: true })
+    } catch {
+      // best-effort
     }
+    logForDebugging('Linux bridge servers closed')
   }
 
   // Close servers in parallel (only if they exist, i.e., were started by us)

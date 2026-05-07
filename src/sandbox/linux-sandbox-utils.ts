@@ -1,10 +1,8 @@
 import shellquote from 'shell-quote'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
-import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import * as net from 'node:net'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
@@ -24,10 +22,17 @@ import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
 
 export interface LinuxNetworkBridgeContext {
+  /** Private mode-0700 directory holding the bridge sockets; removed on reset(). */
+  socketDir: string
   httpSocketPath: string
   socksSocketPath: string
-  httpBridgeProcess: ChildProcess
-  socksBridgeProcess: ChildProcess
+  /**
+   * In-process Unix-socket → TCP listeners, replacing the host-side socat
+   * processes. The proxy data plane between the Unix socket and the local
+   * proxy server never leaves the node process.
+   */
+  httpBridgeServer: net.Server
+  socksBridgeServer: net.Server
   httpProxyPort: number
   socksProxyPort: number
 }
@@ -468,13 +473,69 @@ export function checkLinuxDependencies(
 }
 
 /**
+ * Pump bytes between two sockets until either side closes or errors.
+ * `pipe()` handles backpressure; tearing both ends down on either error
+ * or close keeps a half-dead connection from leaking fds.
+ */
+function relayPair(a: net.Socket, b: net.Socket): void {
+  const teardown = () => {
+    a.destroy()
+    b.destroy()
+  }
+  a.on('error', teardown)
+  b.on('error', teardown)
+  a.on('close', teardown)
+  b.on('close', teardown)
+  a.pipe(b)
+  b.pipe(a)
+}
+
+/**
+ * Listen on a Unix socket and forward each accepted connection to a TCP port
+ * on loopback. Replaces `socat UNIX-LISTEN:<path>,fork,reuseaddr
+ * TCP:localhost:<port>,keepalive,...`. Runs in-process: the proxy servers
+ * already live on this event loop, so this is just an extra listener instead
+ * of two extra OS processes (and the spawn / SIGTERM / SIGKILL / poll-for-
+ * socket lifecycle that came with them).
+ */
+function startUnixToTcpBridge(
+  unixSocketPath: string,
+  tcpPort: number,
+  label: string,
+): Promise<net.Server> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer({ pauseOnConnect: true }, client => {
+      const upstream = net.connect({ port: tcpPort, host: '127.0.0.1' })
+      upstream.setKeepAlive(true, 10_000)
+      upstream.once('connect', () => {
+        client.resume()
+        relayPair(client, upstream)
+      })
+      upstream.once('error', err => {
+        logForDebugging(`[Sandbox] ${label} bridge upstream error: ${err}`)
+        client.destroy()
+      })
+    })
+    server.on('error', reject)
+    server.listen(unixSocketPath, () => {
+      server.removeListener('error', reject)
+      logForDebugging(
+        `[Sandbox] ${label} bridge listening on ${unixSocketPath} -> 127.0.0.1:${tcpPort}`,
+      )
+      resolve(server)
+    })
+  })
+}
+
+/**
  * Initialize the Linux network bridge for sandbox networking
  *
  * ARCHITECTURE NOTE:
  * Linux network sandboxing uses bwrap --unshare-net which creates a completely isolated
  * network namespace with NO network access. To enable network access, we:
  *
- * 1. Host side: Run socat bridges that listen on Unix sockets and forward to host proxy servers
+ * 1. Host side: in-process node:net listeners on Unix sockets that forward to the
+ *    host proxy servers
  *    - HTTP bridge: Unix socket -> host HTTP proxy (for HTTP/HTTPS traffic)
  *    - SOCKS bridge: Unix socket -> host SOCKS5 proxy (for SSH/git traffic)
  *
@@ -491,135 +552,56 @@ export function checkLinuxDependencies(
  * at the host proxy level, not the sandbox boundary. This means network restrictions on Linux
  * depend on the proxy's filtering capabilities.
  *
- * DEPENDENCIES: Requires bwrap (bubblewrap) and socat
+ * DEPENDENCIES: Requires bwrap (bubblewrap) and socat (sandbox side only).
  */
 export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
-  socatPath?: string,
 ): Promise<LinuxNetworkBridgeContext> {
-  const socat = socatPath ?? 'socat'
-  const socketId = randomBytes(8).toString('hex')
-  const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
-  const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
+  // The bridge sockets are unauthenticated entry points into the filtered
+  // proxy. Keep them inside a private mode-0700 mkdtemp directory so no other
+  // local uid can ever traverse to them — there is no window where the socket
+  // file itself is reachable by other users. (A post-listen chmod() of the
+  // socket file would race: server.listen() creates the inode with umask-
+  // derived permissions before the chmod runs.) bwrap bind-mounts the socket
+  // files into the sandbox, where the uid is identity-mapped, so the sandbox
+  // can connect; --unshare-net blocks every other path back to these proxies.
+  const socketDir = fs.mkdtempSync(join(tmpdir(), 'srt-bridge-'))
+  fs.chmodSync(socketDir, 0o700)
+  const httpSocketPath = join(socketDir, 'http.sock')
+  const socksSocketPath = join(socketDir, 'socks.sock')
 
-  // Start HTTP bridge
-  const httpSocatArgs = [
-    `UNIX-LISTEN:${httpSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
-
-  logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`)
-
-  const httpBridgeProcess = spawn(socat, httpSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!httpBridgeProcess.pid) {
-    throw new Error('Failed to start HTTP bridge process')
-  }
-
-  // Add error and exit handlers to monitor bridge health
-  httpBridgeProcess.on('error', err => {
-    logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
-  })
-  httpBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `HTTP bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
+  let httpBridgeServer: net.Server | undefined
+  try {
+    httpBridgeServer = await startUnixToTcpBridge(
+      httpSocketPath,
+      httpProxyPort,
+      'HTTP',
     )
-  })
-
-  // Start SOCKS bridge
-  const socksSocatArgs = [
-    `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
-
-  logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`)
-
-  const socksBridgeProcess = spawn(socat, socksSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!socksBridgeProcess.pid) {
-    // Clean up HTTP bridge
-    if (httpBridgeProcess.pid) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-      } catch {
-        // Ignore errors
-      }
-    }
-    throw new Error('Failed to start SOCKS bridge process')
-  }
-
-  // Add error and exit handlers to monitor bridge health
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
+    const socksBridgeServer = await startUnixToTcpBridge(
+      socksSocketPath,
+      socksProxyPort,
+      'SOCKS',
     )
-  })
-
-  // Wait for both sockets to be ready
-  const maxAttempts = 5
-  for (let i = 0; i < maxAttempts; i++) {
-    if (
-      !httpBridgeProcess.pid ||
-      httpBridgeProcess.killed ||
-      !socksBridgeProcess.pid ||
-      socksBridgeProcess.killed
-    ) {
-      throw new Error('Linux bridge process died unexpectedly')
+    return {
+      socketDir,
+      httpSocketPath,
+      socksSocketPath,
+      httpBridgeServer,
+      socksBridgeServer,
+      httpProxyPort,
+      socksProxyPort,
     }
-
+  } catch (err) {
+    // Don't leak a half-started HTTP listener (and its socket file) until
+    // reset() if the SOCKS listener fails to bind.
+    httpBridgeServer?.close()
     try {
-      // fs already imported
-      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSocketPath)) {
-        logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
-        break
-      }
-    } catch (err) {
-      logForDebugging(`Error checking sockets (attempt ${i + 1}): ${err}`, {
-        level: 'error',
-      })
+      fs.rmSync(socketDir, { recursive: true, force: true })
+    } catch {
+      // best-effort
     }
-
-    if (i === maxAttempts - 1) {
-      // Clean up both processes
-      if (httpBridgeProcess.pid) {
-        try {
-          process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
-      }
-      if (socksBridgeProcess.pid) {
-        try {
-          process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
-      }
-      throw new Error(
-        `Failed to create bridge sockets after ${maxAttempts} attempts`,
-      )
-    }
-
-    await new Promise(resolve => setTimeout(resolve, i * 100))
-  }
-
-  return {
-    httpSocketPath,
-    socksSocketPath,
-    httpBridgeProcess,
-    socksBridgeProcess,
-    httpProxyPort,
-    socksProxyPort,
+    throw err
   }
 }
 
