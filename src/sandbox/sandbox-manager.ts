@@ -40,6 +40,7 @@ import {
   stripBrackets,
 } from './parent-proxy.js'
 import { isIP } from 'node:net'
+import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
@@ -773,6 +774,118 @@ function cleanupAfterCommand(): void {
   cleanupBwrapMountPoints()
 }
 
+/**
+ * How long to wait for a bridge process to exit after SIGTERM before
+ * escalating to SIGKILL.
+ *
+ * socat exits within ~10ms of SIGTERM; this is purely a safety margin.
+ * Keep it well below bun's default 5s test/hook timeout: when a bridge's
+ * `'exit'` event is missed entirely (a Linux-only Bun pidfd notification
+ * bug, oven-sh/bun#30301), this timer is the only thing that lets `reset()`
+ * make progress, and a 5000ms value here loses the race against the hook
+ * timer by a couple of milliseconds — that race was the dominant CI flake.
+ */
+const BRIDGE_EXIT_TIMEOUT_MS = 1500
+
+/**
+ * SIGTERM a bridge process and resolve once it has exited.
+ *
+ * Returns immediately if the process has already exited (`.exitCode` /
+ * `.signalCode` set) — registering `.once('exit')` after the event has
+ * already been emitted produces a listener that never fires.
+ *
+ * Falls back to SIGKILL after {@link BRIDGE_EXIT_TIMEOUT_MS}.
+ */
+function killBridgeProcess(proc: ChildProcess, label: string): Promise<void> {
+  // Already exited → 'exit' already emitted → a fresh once('exit') would
+  // never fire. Don't wait on it.
+  if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) {
+    return Promise.resolve()
+  }
+
+  try {
+    process.kill(proc.pid, 'SIGTERM')
+    logForDebugging(`Sent SIGTERM to ${label} bridge process`)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
+      logForDebugging(`Error killing ${label} bridge: ${err}`, {
+        level: 'error',
+      })
+    }
+    // ESRCH = process already gone; nothing to wait for either way.
+    return Promise.resolve()
+  }
+
+  return new Promise<void>(resolve => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve()
+    }
+    proc.once('exit', () => {
+      logForDebugging(`${label} bridge process exited`)
+      done()
+    })
+    const timer = setTimeout(() => {
+      // Re-check liveness — the 'exit' may have raced us.
+      if (proc.exitCode === null && proc.signalCode === null) {
+        logForDebugging(`${label} bridge did not exit, forcing SIGKILL`, {
+          level: 'warn',
+        })
+        try {
+          if (proc.pid) process.kill(proc.pid, 'SIGKILL')
+        } catch {
+          // Process may have already exited
+        }
+      }
+      done()
+    }, BRIDGE_EXIT_TIMEOUT_MS)
+    // The bridge process is being torn down; this timer must not be the
+    // only thing keeping the event loop alive.
+    timer.unref?.()
+  })
+}
+
+/**
+ * Forcibly close an http.Server, including any in-flight requests.
+ *
+ * Plain `server.close()` waits for every active request to finish.
+ * The proxy may be mid-upstream-request when reset() runs (e.g. a test's
+ * curl was killed by --max-time while the proxy was still dialing the
+ * real example.com / api.github.com), and `dialDirect()` allows up to
+ * 30s before giving up. Combined with a socat fork that hasn't yet seen
+ * its unix-socket EOF, that leaves a fully-open inbound connection and
+ * `server.close()` never calls back. `closeAllConnections()` (Node 18.2+,
+ * also implemented in Bun) tears down those sockets so `close()` resolves
+ * immediately.
+ */
+function forceCloseHttpServer(
+  server: ReturnType<typeof createHttpProxyServer>,
+): Promise<void> {
+  return new Promise<void>(resolve => {
+    // Must run *before* close(): in Bun, close() also detaches the
+    // underlying handle, so a closeAllConnections() called afterwards
+    // becomes a no-op and the close callback waits for the in-flight
+    // request to drain — defeating the purpose. With closeAllConnections()
+    // first, the connections are gone by the time close() runs and its
+    // callback fires immediately (Bun reports "Server is not running.",
+    // Node reports no error). Verified against both orderings.
+    if (typeof server.closeAllConnections === 'function') {
+      server.closeAllConnections()
+    }
+    server.close(error => {
+      if (error && error.message !== 'Server is not running.') {
+        logForDebugging(`Error closing HTTP proxy server: ${error.message}`, {
+          level: 'error',
+        })
+      }
+      resolve()
+    })
+  })
+}
+
 async function reset(): Promise<void> {
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
@@ -792,91 +905,11 @@ async function reset(): Promise<void> {
       socksBridgeProcess,
     } = managerContext.linuxBridge
 
-    // Create array to wait for process exits
-    const exitPromises: Promise<void>[] = []
-
-    // Kill HTTP bridge and wait for it to exit
-    if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Sent SIGTERM to HTTP bridge process')
-
-        // Wait for process to exit
-        exitPromises.push(
-          new Promise<void>(resolve => {
-            httpBridgeProcess.once('exit', () => {
-              logForDebugging('HTTP bridge process exited')
-              resolve()
-            })
-            // Timeout after 5 seconds
-            setTimeout(() => {
-              if (!httpBridgeProcess.killed) {
-                logForDebugging('HTTP bridge did not exit, forcing SIGKILL', {
-                  level: 'warn',
-                })
-                try {
-                  if (httpBridgeProcess.pid) {
-                    process.kill(httpBridgeProcess.pid, 'SIGKILL')
-                  }
-                } catch {
-                  // Process may have already exited
-                }
-              }
-              resolve()
-            }, 5000)
-          }),
-        )
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing HTTP bridge: ${err}`, {
-            level: 'error',
-          })
-        }
-      }
-    }
-
-    // Kill SOCKS bridge and wait for it to exit
-    if (socksBridgeProcess.pid && !socksBridgeProcess.killed) {
-      try {
-        process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Sent SIGTERM to SOCKS bridge process')
-
-        // Wait for process to exit
-        exitPromises.push(
-          new Promise<void>(resolve => {
-            socksBridgeProcess.once('exit', () => {
-              logForDebugging('SOCKS bridge process exited')
-              resolve()
-            })
-            // Timeout after 5 seconds
-            setTimeout(() => {
-              if (!socksBridgeProcess.killed) {
-                logForDebugging('SOCKS bridge did not exit, forcing SIGKILL', {
-                  level: 'warn',
-                })
-                try {
-                  if (socksBridgeProcess.pid) {
-                    process.kill(socksBridgeProcess.pid, 'SIGKILL')
-                  }
-                } catch {
-                  // Process may have already exited
-                }
-              }
-              resolve()
-            }, 5000)
-          }),
-        )
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing SOCKS bridge: ${err}`, {
-            level: 'error',
-          })
-        }
-      }
-    }
-
-    // Wait for both processes to exit
-    await Promise.all(exitPromises)
+    // Kill both bridges and wait for them to exit
+    await Promise.all([
+      killBridgeProcess(httpBridgeProcess, 'HTTP'),
+      killBridgeProcess(socksBridgeProcess, 'SOCKS'),
+    ])
 
     // Clean up sockets
     if (httpSocketPath) {
@@ -906,18 +939,7 @@ async function reset(): Promise<void> {
   const closePromises: Promise<void>[] = []
 
   if (httpProxyServer) {
-    const server = httpProxyServer // Capture reference to avoid TypeScript error
-    const httpClose = new Promise<void>(resolve => {
-      server.close(error => {
-        if (error && error.message !== 'Server is not running.') {
-          logForDebugging(`Error closing HTTP proxy server: ${error.message}`, {
-            level: 'error',
-          })
-        }
-        resolve()
-      })
-    })
-    closePromises.push(httpClose)
+    closePromises.push(forceCloseHttpServer(httpProxyServer))
   }
 
   if (socksProxyServer) {

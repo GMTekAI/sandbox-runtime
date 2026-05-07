@@ -1,5 +1,6 @@
-import type { Socket, Server } from 'node:net'
+import type { Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
+import type { Server } from 'node:http'
 import { Agent, createServer } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
