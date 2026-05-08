@@ -85,10 +85,17 @@ export default [
         'error',
         {
           version: '>=18.0.0',
-          // Request/Headers are global since Node 18.0.0 (stable in 21); the
-          // rule is overly conservative. They're also stable in Bun, which is
-          // SRT's primary runtime.
-          ignores: ['Request', 'Headers'],
+          // Web-standard Request/Headers/ReadableStream and the
+          // Readable.toWeb/fromWeb adapters are available since Node 18.0.0
+          // (the rule flags them as experimental until 21–23) and stable in
+          // Bun, which is SRT's primary runtime.
+          ignores: [
+            'Request',
+            'Headers',
+            'ReadableStream',
+            'stream.Readable.toWeb',
+            'stream.Readable.fromWeb',
+          ],
         },
       ],
       'no-async-promise-executor': 'off',

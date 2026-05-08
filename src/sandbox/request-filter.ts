@@ -9,6 +9,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 
 export type RequestDecision = {
@@ -24,9 +25,10 @@ export type RequestDecision = {
 /**
  * Called once per HTTP request that the proxy parses.
  *
- * - `request` is a web-standard `Request`. v1 populates method, URL, and
- *   headers; `request.body` is `null` (body inspection is a follow-up).
- *   `request.signal` aborts when the client disconnects.
+ * - `request` is a web-standard `Request`: method, URL, headers, and a lazy
+ *   `request.body` stream (one branch of a tee — reading it does not consume
+ *   the bytes that get forwarded upstream). `request.signal` aborts when the
+ *   client disconnects.
  * - **Throwing or rejecting denies the request.** This is the failure
  *   contract for a security boundary: a buggy policy fails closed.
  */
@@ -34,9 +36,20 @@ export type FilterRequestCallback = (
   request: Request,
 ) => Promise<RequestDecision>
 
+const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+
 /**
- * Build a `Request`, run the callback, and if denied write the 403 response.
- * Returns true if the request may proceed upstream.
+ * Build a `Request`, run the callback, and if denied write the 403 response
+ * and return `null`. On allow, returns the body stream the caller must pipe
+ * upstream — this is the original `IncomingMessage` when no tee was needed
+ * (GET/HEAD/OPTIONS), or the upstream-side branch of the tee otherwise.
+ * Callers must pipe the returned stream (not `req`) to the outbound request.
+ *
+ * For methods that carry a body, `req` is converted to a web stream and
+ * `tee()`'d: one branch goes to the callback's `Request.body`, the other is
+ * returned for the caller to forward. If the callback never reads its
+ * branch, we cancel it after the decision so the tee does not buffer the
+ * entire upload.
  */
 export async function decideAndRespond(
   filterRequest: FilterRequestCallback,
@@ -44,16 +57,23 @@ export async function decideAndRespond(
   res: ServerResponse,
   url: string,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<Readable | null> {
+  let forCallback: ReadableStream<Uint8Array> | undefined
+  let forUpstream: Readable = req
+  if (!BODYLESS_METHODS.has(req.method ?? 'GET')) {
+    const web = Readable.toWeb(req) as ReadableStream<Uint8Array>
+    const [a, b] = web.tee()
+    forCallback = a
+    forUpstream = Readable.fromWeb(b)
+  }
+
   let webReq: Request
   try {
     webReq = new Request(url, {
       method: req.method,
       headers: incomingHeaders(req),
-      // v1: body inspection deferred. Callbacks see request.body === null.
-      // TODO(terminating-tls): tee req → ReadableStream so policies can read
-      // the body without consuming the upstream pipe.
       signal,
+      ...(forCallback ? { body: forCallback, duplex: 'half' as const } : {}),
     })
   } catch (err) {
     // Malformed URL/headers from the client — deny rather than crash.
@@ -61,7 +81,9 @@ export async function decideAndRespond(
       action: 'deny',
       reason: `malformed request: ${(err as Error).message}`,
     })
-    return false
+    void forCallback?.cancel()
+    forUpstream.destroy()
+    return null
   }
 
   let decision: RequestDecision
@@ -74,13 +96,21 @@ export async function decideAndRespond(
     }
   }
 
+  // If the callback didn't read its branch, cancel it so tee() stops
+  // buffering bytes nobody will consume. If it did, the tee already buffered
+  // whatever was read; the upstream branch sees the same bytes.
+  if (forCallback && !webReq.bodyUsed) {
+    void forCallback.cancel()
+  }
+
   if (decision.action === 'allow') {
     logForDebugging(`[request-filter] allow ${req.method} ${url}`)
-    return true
+    return forUpstream
   }
 
   deny(res, decision)
-  return false
+  forUpstream.destroy()
+  return null
 }
 
 function deny(res: ServerResponse, decision: RequestDecision): void {

@@ -30,8 +30,14 @@ describe('network.filterRequest', () => {
     upstream = createHttpsServer(
       { cert: upLeafOnly, key: upCert.keyPem },
       (req, res) => {
-        res.writeHead(200, { 'x-upstream': 'ok' })
-        res.end(JSON.stringify({ path: req.url, method: req.method }))
+        let body = ''
+        req.on('data', c => (body += c))
+        req.on('end', () => {
+          res.writeHead(200, { 'x-upstream': 'ok' })
+          res.end(
+            JSON.stringify({ path: req.url, method: req.method, echoed: body }),
+          )
+        })
       },
     )
     await new Promise<void>(r => upstream.listen(0, '127.0.0.1', r))
@@ -142,6 +148,49 @@ describe('network.filterRequest', () => {
     )
   })
 
+  test('callback can read the body; upstream still receives it', async () => {
+    let seenBody = ''
+    await withProxy(
+      async req => {
+        seenBody = await req.text()
+        return seenBody.includes('forbidden')
+          ? { action: 'deny', reason: 'body matched forbidden' }
+          : { action: 'allow' }
+      },
+      async port => {
+        const a = await curl(port, `https://127.0.0.1:${upstreamPort}/up`, {
+          method: 'POST',
+          body: 'hello-from-client',
+        })
+        expect(a.status).toBe(200)
+        expect(seenBody).toBe('hello-from-client')
+        // Upstream got the same bytes the callback read.
+        expect(JSON.parse(a.body).echoed).toBe('hello-from-client')
+
+        const b = await curl(port, `https://127.0.0.1:${upstreamPort}/up`, {
+          method: 'POST',
+          body: 'this is forbidden content',
+        })
+        expect(b.status).toBe(403)
+        expect(b.body.trim()).toBe('body matched forbidden')
+      },
+    )
+  })
+
+  test('callback that ignores body does not buffer it (upstream still gets it)', async () => {
+    await withProxy(
+      async () => ({ action: 'allow' }),
+      async port => {
+        const r = await curl(port, `https://127.0.0.1:${upstreamPort}/up`, {
+          method: 'POST',
+          body: 'passthrough',
+        })
+        expect(r.status).toBe(200)
+        expect(JSON.parse(r.body).echoed).toBe('passthrough')
+      },
+    )
+  })
+
   test('also gates plain HTTP through the proxy', async () => {
     let seen: Request | undefined
     const httpUp = (await import('node:http')).createServer((_req, res) => {
@@ -202,7 +251,7 @@ type CurlResult = {
 async function curl(
   proxyPort: number,
   url: string,
-  opts: { headers?: string[] } = {},
+  opts: { headers?: string[]; method?: string; body?: string } = {},
 ): Promise<CurlResult> {
   const args = [
     '-sS',
@@ -216,6 +265,8 @@ async function curl(
     '-',
   ]
   for (const h of opts.headers ?? []) args.push('-H', h)
+  if (opts.method) args.push('-X', opts.method)
+  if (opts.body !== undefined) args.push('--data-binary', opts.body)
   args.push(url)
 
   const child = spawn('curl', args)

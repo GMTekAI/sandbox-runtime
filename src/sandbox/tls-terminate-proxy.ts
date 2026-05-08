@@ -18,7 +18,7 @@ import { connect, isIP } from 'node:net'
 import { unlink } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Duplex } from 'node:stream'
+import type { Duplex, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
@@ -143,6 +143,7 @@ async function forwardUpstream(
   res: ServerResponse,
   target: TerminateTarget,
 ): Promise<void> {
+  let body: Readable = req
   if (filterRequest) {
     const ac = new AbortController()
     res.once('close', () => ac.abort())
@@ -151,14 +152,15 @@ async function forwardUpstream(
       (target.port === 443
         ? target.hostname
         : `${target.hostname}:${target.port}`)
-    const ok = await decideAndRespond(
+    const out = await decideAndRespond(
       filterRequest,
       req,
       res,
       `https://${host}${req.url ?? '/'}`,
       ac.signal,
     )
-    if (!ok) return
+    if (out === null) return
+    body = out
   }
 
   // Bun's https.request verifies the upstream cert against headers.host
@@ -205,7 +207,7 @@ async function forwardUpstream(
   })
 
   res.on('close', () => upstream.destroy())
-  req.pipe(upstream)
+  body.pipe(upstream)
 }
 
 let sockSeq = 0

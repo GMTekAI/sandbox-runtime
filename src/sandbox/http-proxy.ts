@@ -1,5 +1,5 @@
 import type { Socket } from 'node:net'
-import type { Duplex } from 'node:stream'
+import type { Duplex, Readable } from 'node:stream'
 import type { Server } from 'node:http'
 import { Agent, createServer } from 'node:http'
 import { request as httpRequest } from 'node:http'
@@ -237,17 +237,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.
+      let body: Readable = req
       if (options.filterRequest) {
         const ac = new AbortController()
         res.once('close', () => ac.abort())
-        const ok = await decideAndRespond(
+        const out = await decideAndRespond(
           options.filterRequest,
           req,
           res,
           absUrl,
           ac.signal,
         )
-        if (!ok) return
+        if (out === null) return
+        body = out
       }
 
       let proxyReq
@@ -325,7 +327,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
 
-      req.pipe(proxyReq)
+      body.pipe(proxyReq)
     } catch (err) {
       logForDebugging(`Error handling HTTP request: ${err}`, { level: 'error' })
       if (!res.headersSent) {
