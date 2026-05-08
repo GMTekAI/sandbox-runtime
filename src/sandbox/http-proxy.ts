@@ -8,6 +8,10 @@ import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
+import {
+  decideAndRespond,
+  type FilterRequestCallback,
+} from './request-filter.js'
 import { terminateAndForward } from './tls-terminate-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
@@ -42,6 +46,12 @@ export interface HttpProxyServerOptions {
    * config layer (sandbox-manager rejects both being set).
    */
   mitmCA?: MitmCA
+
+  /**
+   * Per-request filter; runs on plain-HTTP proxy requests and on terminated
+   * HTTPS requests. See request-filter.ts.
+   */
+  filterRequest?: FilterRequestCallback
 
   /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
@@ -108,11 +118,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // layer, so the first two never both apply.)
       if (options.mitmCA) {
         if (clientGone) return
-        terminateAndForward(options.mitmCA, socket, head, {
-          hostname,
-          port,
-          upstreamCA: options.tlsTerminateUpstreamCA,
-        })
+        terminateAndForward(
+          options.mitmCA,
+          options.filterRequest,
+          socket,
+          head,
+          { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+        )
         return
       }
 
@@ -222,6 +234,21 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
       const absUrl = `${url.protocol}//${url.host}${url.pathname}${url.search}`
+
+      // Per-request filter applies to plain HTTP too — otherwise a sandboxed
+      // client could bypass it by using http:// where the upstream serves it.
+      if (options.filterRequest) {
+        const ac = new AbortController()
+        res.once('close', () => ac.abort())
+        const ok = await decideAndRespond(
+          options.filterRequest,
+          req,
+          res,
+          absUrl,
+          ac.signal,
+        )
+        if (!ok) return
+      }
 
       let proxyReq
       if (mitmSocketPath) {

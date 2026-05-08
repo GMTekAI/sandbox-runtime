@@ -5,7 +5,8 @@
  * instead of opening an opaque byte tunnel. We terminate the client's TLS
  * with a per-host leaf cert (see mitm-leaf.ts), parse the decrypted stream
  * as HTTP/1.1, and re-issue each request upstream over a real TLS
- * connection. This is the point where content filtering will hook in.
+ * connection. The optional `filterRequest` callback runs on each parsed
+ * request before it is forwarded.
  */
 
 import {
@@ -20,6 +21,10 @@ import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
+import {
+  decideAndRespond,
+  type FilterRequestCallback,
+} from './request-filter.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
 
@@ -52,6 +57,7 @@ export type TerminateTarget = {
  */
 export function terminateAndForward(
   ca: MitmCA,
+  filterRequest: FilterRequestCallback | undefined,
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
@@ -73,7 +79,9 @@ export function terminateAndForward(
     },
   })
 
-  inner.on('request', (req, res) => forwardUpstream(req, res, target))
+  inner.on('request', (req, res) => {
+    void forwardUpstream(filterRequest, req, res, target)
+  })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
       `[tls-terminate] client TLS error for ${target.hostname}: ${err.message}`,
@@ -129,20 +137,36 @@ export function terminateAndForward(
   inner.unref()
 }
 
-function forwardUpstream(
+async function forwardUpstream(
+  filterRequest: FilterRequestCallback | undefined,
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
-): void {
+): Promise<void> {
+  if (filterRequest) {
+    const ac = new AbortController()
+    res.once('close', () => ac.abort())
+    const host =
+      req.headers.host ??
+      (target.port === 443
+        ? target.hostname
+        : `${target.hostname}:${target.port}`)
+    const ok = await decideAndRespond(
+      filterRequest,
+      req,
+      res,
+      `https://${host}${req.url ?? '/'}`,
+      ac.signal,
+    )
+    if (!ok) return
+  }
+
   // Bun's https.request verifies the upstream cert against headers.host
   // verbatim (including ":port"), which never matches a SAN. Drop the host
   // header and let the runtime derive it from {host, port} — same wire value,
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
-
-  // TODO(terminating-tls): content-filter hook goes here, between
-  // parse and forward.
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(

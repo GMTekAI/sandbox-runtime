@@ -3,6 +3,8 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
+import type { FilterRequestCallback } from './request-filter.js'
+
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 
@@ -173,6 +175,19 @@ export const NetworkConfigSchema = z.object({
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
   ),
+  filterRequest: z
+    .custom<FilterRequestCallback>(v => typeof v === 'function', {
+      message: 'filterRequest must be a function',
+    })
+    .optional()
+    .describe(
+      'Per-request filter callback. Receives the parsed HTTP request ' +
+        '(web-standard Request) and returns {action, reason?}. Denied ' +
+        'requests get a 403 with the reason. If the callback throws, the ' +
+        'request is denied. Applies to plain HTTP through the proxy and, ' +
+        'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
+        'provide a policy language; library consumers own matching.',
+    ),
   tlsTerminate: z
     .object({
       caCertPath: z

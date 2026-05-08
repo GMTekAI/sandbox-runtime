@@ -85,7 +85,10 @@ export default [
         'error',
         {
           version: '>=18.0.0',
-          ignores: [],
+          // Request/Headers are global since Node 18.0.0 (stable in 21); the
+          // rule is overly conservative. They're also stable in Bun, which is
+          // SRT's primary runtime.
+          ignores: ['Request', 'Headers'],
         },
       ],
       'no-async-promise-executor': 'off',
