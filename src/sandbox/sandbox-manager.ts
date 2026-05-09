@@ -765,8 +765,12 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
-  // Deep clone the config to avoid mutations
-  config = structuredClone(newConfig)
+  // Deep clone the config to avoid mutations. structuredClone cannot clone
+  // functions, so pull filterRequest out, clone the rest, and put it back —
+  // a function reference is immutable in the sense that matters here.
+  const { filterRequest, ...rest } = newConfig.network
+  config = structuredClone({ ...newConfig, network: rest })
+  config.network.filterRequest = filterRequest
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
