@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { X509Certificate } from 'node:crypto'
 import { createSecureContext } from 'node:tls'
-import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
+import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert, secureContextFor } from '../../src/sandbox/mitm-leaf.js'
 import { whichSync } from '../../src/utils/which.js'
 
@@ -72,22 +72,32 @@ describe('mitm-leaf: mintLeafCert', () => {
   // Chain verification via openssl — the strongest correctness signal.
   // Skipped only if openssl is unavailable.
   const verifyTest = whichSync('openssl') !== null ? test : test.skip
-  verifyTest('leaf verifies against the CA via `openssl verify`', () => {
-    const leaf = mintLeafCert(ca, 'verify.example')
-    const dir = mkdtempSync(join(tmpdir(), 'srt-mitm-leaf-'))
-    try {
-      const leafPath = join(dir, 'leaf.crt')
-      writeFileSync(leafPath, firstPemBlock(leaf.certPem))
-      const out = execFileSync(
-        'openssl',
-        ['verify', '-CAfile', CA_CERT, leafPath],
-        { encoding: 'utf8' },
-      )
-      expect(out.trim()).toMatch(/: OK$/)
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
+  verifyTest(
+    'leaf verifies against the CA via `openssl verify` (fixture and ephemeral)',
+    async () => {
+      // Regression: with an ephemeral (forge-generated) CA, node-forge stores
+      // the SKI as a hex string, which the leaf's authorityKeyIdentifier was
+      // copying verbatim → AKI ≠ SKI → chain verification failed.
+      const ephemeral = createMitmCA({})
+      const dir = mkdtempSync(join(tmpdir(), 'srt-mitm-leaf-'))
+      try {
+        for (const c of [ca, ephemeral]) {
+          const leaf = mintLeafCert(c, 'verify.example')
+          const leafPath = join(dir, 'leaf.crt')
+          writeFileSync(leafPath, firstPemBlock(leaf.certPem))
+          const out = execFileSync(
+            'openssl',
+            ['verify', '-CAfile', c.certPath, leafPath],
+            { encoding: 'utf8' },
+          )
+          expect(out.trim()).toMatch(/: OK$/)
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        await disposeMitmCA(ephemeral)
+      }
+    },
+  )
 })
 
 function firstPemBlock(pem: string): string {

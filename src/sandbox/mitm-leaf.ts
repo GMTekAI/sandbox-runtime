@@ -48,15 +48,12 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
     },
     { name: 'extKeyUsage', serverAuth: true },
     { name: 'subjectAltName', altNames: [sanFor(hostname)] },
-    {
-      name: 'authorityKeyIdentifier',
-      keyIdentifier:
-        (
-          ca.cert.getExtension('subjectKeyIdentifier') as {
-            subjectKeyIdentifier?: string
-          } | null
-        )?.subjectKeyIdentifier ?? true,
-    },
+    // No authorityKeyIdentifier: node-forge stores SKI as a hex string for
+    // in-memory certs (e.g. the ephemeral CA) but as raw bytes for certs
+    // parsed from PEM (e.g. a user-supplied CA). Passing the hex string as
+    // keyIdentifier produces an AKI that doesn't match the CA's SKI and
+    // chain verification fails. AKI is optional — issuer/subject DN match
+    // is sufficient — so omit it.
   ])
   cert.sign(ca.key, md.sha256.create())
 
