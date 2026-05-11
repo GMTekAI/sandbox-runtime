@@ -186,6 +186,11 @@ async function forwardUpstream(
       // omitting the key, so spread conditionally.
       ...(isIP(target.hostname) ? {} : { servername: target.hostname }),
       ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
+      // No global agent: a proxy's outbound leg shouldn't share a connection
+      // pool keyed on the proxy process. Also works around a Bun quirk where
+      // the first request's `ca:` value is cached on the global agent and
+      // subsequent calls with a different `ca:` are silently ignored.
+      agent: false,
     },
     upRes => {
       res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))

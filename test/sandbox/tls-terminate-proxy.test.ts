@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
-import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
+import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
@@ -145,6 +145,67 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
   })
 })
 
+// Regression: same end-to-end path with an SRT-generated ephemeral CA
+// (createMitmCA({})). #259 introduced ephemeral CAs; the leaf-minting AKI
+// extension turned out to encode the SKI as a hex string (rather than raw
+// bytes) for forge-created CAs, breaking chain verification — caught only
+// when testing against a non-fixture CA.
+describe('tls-terminate-proxy: end-to-end with ephemeral CA', () => {
+  test('curl trusts the ephemeral-CA-signed leaf and round-trips', async () => {
+    const ca = createMitmCA({})
+    // Upstream uses the FIXTURE CA (same as the other describe) so the
+    // proxy's outbound `ca:` value is identical across the file — Bun's
+    // https.request caches the first `ca:` process-wide. The regression
+    // under test is the client-facing leaf (ephemeral CA → curl), which is
+    // covered by mitmCA below + curl --cacert pointing at the ephemeral CA.
+    const fixtureCA = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+    const upCert = mintLeafCert(fixtureCA, '127.0.0.1')
+    const upLeafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    const upstream = createHttpsServer(
+      { cert: upLeafOnly, key: upCert.keyPem },
+      (req, res) => {
+        let body = ''
+        req.on('data', c => (body += c))
+        req.on('end', () => {
+          res.writeHead(200, { 'x-upstream': 'ok' })
+          res.end(JSON.stringify({ echoed: body, path: req.url }))
+        })
+      },
+    )
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', r))
+    const upstreamPort = (upstream.address() as AddressInfo).port
+
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: ca,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const proxyPort = (proxy.address() as AddressInfo).port
+
+    try {
+      const r = await curlViaProxy(
+        proxyPort,
+        `https://127.0.0.1:${upstreamPort}/hello?a=1`,
+        { method: 'POST', body: 'from-ephemeral', cacert: ca.certPath },
+      )
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(r.headers['x-upstream']).toBe('ok')
+      const parsed = JSON.parse(r.body)
+      expect(parsed.echoed).toBe('from-ephemeral')
+      expect(parsed.path).toBe('/hello?a=1')
+      expect(r.stderr).toMatch(/issuer:.*sandbox-runtime ephemeral CA/)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await new Promise<void>(r => upstream.close(() => r()))
+      await disposeMitmCA(ca)
+    }
+  })
+})
+
 type CurlResult = {
   exit: number
   status: number
@@ -156,7 +217,7 @@ type CurlResult = {
 async function curlViaProxy(
   proxyPort: number,
   url: string,
-  opts: { method?: string; body?: string } = {},
+  opts: { method?: string; body?: string; cacert?: string } = {},
 ): Promise<CurlResult> {
   const args = [
     '-sS',
@@ -164,7 +225,7 @@ async function curlViaProxy(
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
     '--cacert',
-    CA_CERT,
+    opts.cacert ?? CA_CERT,
     '--max-time',
     '10',
     '-D',
