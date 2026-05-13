@@ -6,7 +6,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
+import type { SandboxRuntimeConfig, LauncherConfig } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
@@ -15,12 +15,13 @@ import type {
 } from './sandbox-schemas.js'
 import {
   wrapCommandWithSandboxLinux,
-  initializeLinuxNetworkBridge,
-  type LinuxNetworkBridgeContext,
+  initializeLinuxNetworkContext,
+  type LinuxNetworkContext,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
-  cleanupBwrapMountPoints,
+  cleanupSandboxMountPoints,
 } from './linux-sandbox-utils.js'
+import type { ProxyListenTarget } from './socks-proxy.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -40,14 +41,21 @@ import {
   stripBrackets,
 } from './parent-proxy.js'
 import { isIP } from 'node:net'
-import type { ChildProcess } from 'node:child_process'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
-  httpProxyPort: number
-  socksProxyPort: number
-  linuxBridge: LinuxNetworkBridgeContext | undefined
+  /**
+   * macOS: the proxy's TCP port (the seatbelt sandbox connects directly).
+   * Linux: undefined for the internal proxy (it listens on a unix socket,
+   * not TCP); the external-proxy port when network.httpProxyPort is set.
+   */
+  httpProxyPort: number | undefined
+  socksProxyPort: number | undefined
+  /** Linux: the unix-socket plumbing the in-sandbox relay connects to. */
+  linux: LinuxNetworkContext | undefined
 }
 
 // ============================================================================
@@ -193,8 +201,9 @@ function getMitmSocketPath(host: string): string | undefined {
 }
 
 async function startHttpProxyServer(
+  target: ProxyListenTarget,
   sandboxAskCallback?: SandboxAskCallback,
-): Promise<number> {
+): Promise<number | string> {
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
@@ -204,54 +213,49 @@ async function startHttpProxyServer(
     parentProxy,
   })
 
-  return new Promise<number>((resolve, reject) => {
-    if (!httpProxyServer) {
+  return new Promise<number | string>((resolve, reject) => {
+    const server = httpProxyServer
+    if (!server) {
       reject(new Error('HTTP proxy server undefined before listen'))
       return
     }
-
-    const server = httpProxyServer
-
     server.once('error', reject)
     server.once('listening', () => {
+      server.unref()
+      if (target.kind === 'unix') {
+        logForDebugging(`HTTP proxy listening on ${target.path}`)
+        resolve(target.path)
+        return
+      }
       const address = server.address()
       if (address && typeof address === 'object') {
-        server.unref()
         logForDebugging(`HTTP proxy listening on localhost:${address.port}`)
         resolve(address.port)
       } else {
         reject(new Error('Failed to get proxy server address'))
       }
     })
-
-    server.listen(0, '127.0.0.1')
+    if (target.kind === 'unix') {
+      server.listen(target.path)
+    } else {
+      server.listen(target.port, target.hostname)
+    }
   })
 }
 
 async function startSocksProxyServer(
+  target: ProxyListenTarget,
   sandboxAskCallback?: SandboxAskCallback,
-): Promise<number> {
+): Promise<number | string> {
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     parentProxy,
   })
 
-  return new Promise<number>((resolve, reject) => {
-    if (!socksProxyServer) {
-      // This is mostly just for the typechecker
-      reject(new Error('SOCKS proxy server undefined before listen'))
-      return
-    }
-
-    socksProxyServer
-      .listen(0, '127.0.0.1')
-      .then((port: number) => {
-        socksProxyServer?.unref()
-        resolve(port)
-      })
-      .catch(reject)
-  })
+  const result = await socksProxyServer.listen(target)
+  socksProxyServer.unref()
+  return result
 }
 
 // ============================================================================
@@ -316,41 +320,78 @@ async function initialize(
   // Initialize network infrastructure
   initializationPromise = (async () => {
     try {
-      // Conditionally start proxy servers based on config
-      let httpProxyPort: number
-      if (config.network.httpProxyPort !== undefined) {
-        // Use external HTTP proxy (don't start a server)
-        httpProxyPort = config.network.httpProxyPort
-        logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
-      } else {
-        // Start local HTTP proxy
-        httpProxyPort = await startHttpProxyServer(sandboxAskCallback)
-      }
+      const platform = getPlatform()
+      const externalHttp = config.network.httpProxyPort
+      const externalSocks = config.network.socksProxyPort
 
-      let socksProxyPort: number
-      if (config.network.socksProxyPort !== undefined) {
-        // Use external SOCKS proxy (don't start a server)
-        socksProxyPort = config.network.socksProxyPort
-        logForDebugging(`Using external SOCKS proxy on port ${socksProxyPort}`)
-      } else {
-        // Start local SOCKS proxy
-        socksProxyPort = await startSocksProxyServer(sandboxAskCallback)
-      }
+      let httpProxyPort: number | undefined
+      let socksProxyPort: number | undefined
+      let linux: LinuxNetworkContext | undefined
 
-      // Initialize platform-specific infrastructure
-      let linuxBridge: LinuxNetworkBridgeContext | undefined
-      if (getPlatform() === 'linux') {
-        linuxBridge = await initializeLinuxNetworkBridge(
-          httpProxyPort,
-          socksProxyPort,
-          config.socatPath,
+      if (platform === 'linux') {
+        // The bridge sockets are unauthenticated entry points into the
+        // filtered proxy. They live inside a private mode-0700 mkdtemp
+        // directory so no other local uid can ever traverse to them; the
+        // sandbox bind-mounts the socket files in, and the in-sandbox uid
+        // is identity-mapped so it can connect.
+        const socketDir = fs.mkdtempSync(join(tmpdir(), 'srt-bridge-'))
+        fs.chmodSync(socketDir, 0o700)
+        const httpSock = join(socketDir, 'http.sock')
+        const socksSock = join(socketDir, 'socks.sock')
+
+        // Internal proxy → listen on the unix socket directly.
+        // External proxy → don't start a server; the relay bridges.
+        if (externalHttp !== undefined) {
+          httpProxyPort = externalHttp
+          logForDebugging(`Using external HTTP proxy on port ${externalHttp}`)
+        } else {
+          await startHttpProxyServer(
+            { kind: 'unix', path: httpSock },
+            sandboxAskCallback,
+          )
+        }
+        if (externalSocks !== undefined) {
+          socksProxyPort = externalSocks
+          logForDebugging(`Using external SOCKS proxy on port ${externalSocks}`)
+        } else {
+          await startSocksProxyServer(
+            { kind: 'unix', path: socksSock },
+            sandboxAskCallback,
+          )
+        }
+
+        linux = await initializeLinuxNetworkContext(
+          httpSock,
+          socksSock,
+          externalHttp,
+          externalSocks,
+          config.launcher,
         )
+      } else {
+        // macOS: TCP listener on an ephemeral port; the seatbelt profile
+        // allows connecting to it directly.
+        if (externalHttp !== undefined) {
+          httpProxyPort = externalHttp
+        } else {
+          httpProxyPort = (await startHttpProxyServer(
+            { kind: 'tcp', port: 0, hostname: '127.0.0.1' },
+            sandboxAskCallback,
+          )) as number
+        }
+        if (externalSocks !== undefined) {
+          socksProxyPort = externalSocks
+        } else {
+          socksProxyPort = (await startSocksProxyServer(
+            { kind: 'tcp', port: 0, hostname: '127.0.0.1' },
+            sandboxAskCallback,
+          )) as number
+        }
       }
 
       const context: HostNetworkManagerContext = {
         httpProxyPort,
         socksProxyPort,
-        linuxBridge,
+        linux,
       }
       managerContext = context
       logForDebugging('Network infrastructure initialized')
@@ -404,18 +445,14 @@ function checkDependencies(ripgrepConfig?: {
   const platform = getPlatform()
   if (platform === 'linux') {
     // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
-    // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
+    // expand glob deny-patterns to concrete paths for bind-mounts. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
     if (whichSync(rgToCheck.command) === null) {
       errors.push(`ripgrep (${rgToCheck.command}) not found`)
     }
 
-    const linuxDeps = checkLinuxDependencies({
-      seccompConfig: config?.seccomp,
-      bwrapPath: config?.bwrapPath,
-      socatPath: config?.socatPath,
-    })
+    const linuxDeps = checkLinuxDependencies(config?.launcher)
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   }
@@ -554,8 +591,8 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
-function getSeccompConfig(): SeccompConfig | undefined {
-  return config?.seccomp
+function getLauncherConfig(): LauncherConfig | undefined {
+  return config?.launcher
 }
 
 function getProxyPort(): number | undefined {
@@ -567,11 +604,11 @@ function getSocksProxyPort(): number | undefined {
 }
 
 function getLinuxHttpSocketPath(): string | undefined {
-  return managerContext?.linuxBridge?.httpSocketPath
+  return managerContext?.linux?.httpSocketPath
 }
 
 function getLinuxSocksSocketPath(): string | undefined {
-  return managerContext?.linuxBridge?.socksSocketPath
+  return managerContext?.linux?.socksSocketPath
 }
 
 /**
@@ -605,7 +642,7 @@ async function wrapWithSandbox(
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   //
-  // Strip trailing /** and filter remaining globs on Linux (bwrap needs
+  // Strip trailing /** and filter remaining globs on Linux (bind-mounts need
   // real paths, not globs; macOS subpath matching is also recursive so
   // stripping is harmless there).
   const stripWriteGlobs = (paths: string[]): string[] =>
@@ -723,12 +760,6 @@ async function wrapWithSandbox(
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
@@ -738,9 +769,7 @@ async function wrapWithSandbox(
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
         allowGitConfig: getAllowGitConfig(),
-        seccompConfig: getSeccompConfig(),
-        bwrapPath: config?.bwrapPath,
-        socatPath: config?.socatPath,
+        launcher: getLauncherConfig(),
         abortSignal,
       })
 
@@ -782,89 +811,15 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
 /**
  * Lightweight cleanup to call after each sandboxed command completes.
  *
- * On Linux, bwrap creates empty files on the host filesystem as mount points
- * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
- * These persist after bwrap exits. This function removes them.
+ * On Linux, protecting non-existent deny paths requires creating empty
+ * files on the host filesystem as bind-mount targets (e.g. ~/.bashrc,
+ * ~/.gitconfig). These persist after the sandbox exits; this removes them.
  *
  * Safe to call on any platform — it's a no-op on macOS.
  * Also called automatically by reset() and on process exit as safety nets.
  */
 function cleanupAfterCommand(): void {
-  cleanupBwrapMountPoints()
-}
-
-/**
- * How long to wait for a bridge process to exit after SIGTERM before
- * escalating to SIGKILL.
- *
- * socat exits within ~10ms of SIGTERM; this is purely a safety margin.
- * Keep it well below bun's default 5s test/hook timeout: when a bridge's
- * `'exit'` event is missed entirely (a Linux-only Bun pidfd notification
- * bug, oven-sh/bun#30301), this timer is the only thing that lets `reset()`
- * make progress, and a 5000ms value here loses the race against the hook
- * timer by a couple of milliseconds — that race was the dominant CI flake.
- */
-const BRIDGE_EXIT_TIMEOUT_MS = 1500
-
-/**
- * SIGTERM a bridge process and resolve once it has exited.
- *
- * Returns immediately if the process has already exited (`.exitCode` /
- * `.signalCode` set) — registering `.once('exit')` after the event has
- * already been emitted produces a listener that never fires.
- *
- * Falls back to SIGKILL after {@link BRIDGE_EXIT_TIMEOUT_MS}.
- */
-function killBridgeProcess(proc: ChildProcess, label: string): Promise<void> {
-  // Already exited → 'exit' already emitted → a fresh once('exit') would
-  // never fire. Don't wait on it.
-  if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) {
-    return Promise.resolve()
-  }
-
-  try {
-    process.kill(proc.pid, 'SIGTERM')
-    logForDebugging(`Sent SIGTERM to ${label} bridge process`)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-      logForDebugging(`Error killing ${label} bridge: ${err}`, {
-        level: 'error',
-      })
-    }
-    // ESRCH = process already gone; nothing to wait for either way.
-    return Promise.resolve()
-  }
-
-  return new Promise<void>(resolve => {
-    let settled = false
-    const done = () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve()
-    }
-    proc.once('exit', () => {
-      logForDebugging(`${label} bridge process exited`)
-      done()
-    })
-    const timer = setTimeout(() => {
-      // Re-check liveness — the 'exit' may have raced us.
-      if (proc.exitCode === null && proc.signalCode === null) {
-        logForDebugging(`${label} bridge did not exit, forcing SIGKILL`, {
-          level: 'warn',
-        })
-        try {
-          if (proc.pid) process.kill(proc.pid, 'SIGKILL')
-        } catch {
-          // Process may have already exited
-        }
-      }
-      done()
-    }, BRIDGE_EXIT_TIMEOUT_MS)
-    // The bridge process is being torn down; this timer must not be the
-    // only thing keeping the event loop alive.
-    timer.unref?.()
-  })
+  cleanupSandboxMountPoints()
 }
 
 /**
@@ -874,7 +829,7 @@ function killBridgeProcess(proc: ChildProcess, label: string): Promise<void> {
  * The proxy may be mid-upstream-request when reset() runs (e.g. a test's
  * curl was killed by --max-time while the proxy was still dialing the
  * real example.com / api.github.com), and `dialDirect()` allows up to
- * 30s before giving up. Combined with a socat fork that hasn't yet seen
+ * 30s before giving up. Combined with a relay child that hasn't yet seen
  * its unix-socket EOF, that leaves a fully-open inbound connection and
  * `server.close()` never calls back. `closeAllConnections()` (Node 18.2+,
  * also implemented in Bun) tears down those sockets so `close()` resolves
@@ -906,9 +861,9 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
-  // Clean up any leftover bwrap mount points. Force past the
+  // Clean up any leftover sandbox mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
-  cleanupBwrapMountPoints({ force: true })
+  cleanupSandboxMountPoints({ force: true })
 
   // Stop log monitor
   if (logMonitorShutdown) {
@@ -916,42 +871,25 @@ async function reset(): Promise<void> {
     logMonitorShutdown = undefined
   }
 
-  if (managerContext?.linuxBridge) {
-    const {
-      httpSocketPath,
-      socksSocketPath,
-      httpBridgeProcess,
-      socksBridgeProcess,
-    } = managerContext.linuxBridge
-
-    // Kill both bridges and wait for them to exit
-    await Promise.all([
-      killBridgeProcess(httpBridgeProcess, 'HTTP'),
-      killBridgeProcess(socksBridgeProcess, 'SOCKS'),
-    ])
-
-    // Clean up sockets
-    if (httpSocketPath) {
+  if (managerContext?.linux) {
+    const { socketDir, httpRelay, socksRelay } = managerContext.linux
+    // External-proxy relays set PR_SET_PDEATHSIG, so they'll go down with us
+    // anyway. SIGKILL them now so the socket directory can be removed and so
+    // we don't keep the event loop alive on the unref'd handle.
+    for (const relay of [httpRelay, socksRelay]) {
       try {
-        fs.rmSync(httpSocketPath, { force: true })
-        logForDebugging('Cleaned up HTTP socket')
-      } catch (err) {
-        logForDebugging(`HTTP socket cleanup error: ${err}`, {
-          level: 'error',
-        })
+        relay?.kill('SIGKILL')
+      } catch {
+        // already gone
       }
     }
-
-    if (socksSocketPath) {
-      try {
-        fs.rmSync(socksSocketPath, { force: true })
-        logForDebugging('Cleaned up SOCKS socket')
-      } catch (err) {
-        logForDebugging(`SOCKS socket cleanup error: ${err}`, {
-          level: 'error',
-        })
-      }
+    // The sockets live in a private mkdtemp directory; remove it whole.
+    try {
+      fs.rmSync(socketDir, { recursive: true, force: true })
+    } catch {
+      // best-effort
     }
+    logForDebugging('Linux network context cleaned up')
   }
 
   // Close servers in parallel (only if they exist, i.e., were started by us)

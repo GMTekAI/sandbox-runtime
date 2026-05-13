@@ -250,7 +250,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     return normalizedPath
   }
 
-  // Resolve symlinks to real paths to avoid bwrap issues
+  // Resolve symlinks to real paths so the launcher's bind-mounts cover the real target
   // Validate that the resolution stays within expected boundaries
   try {
     const resolvedPath = fs.realpathSync(normalizedPath)
@@ -316,6 +316,13 @@ export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
   caCertPath?: string,
+  /**
+   * Linux only: absolute path to the srt-launcher binary as it appears
+   * *inside* the sandbox (the host filesystem is bind-mounted, so this is the
+   * same path getSrtLauncherPath() resolved on the host). Used for
+   * GIT_SSH_COMMAND's ProxyCommand.
+   */
+  launcherPath?: string,
 ): string[] {
   // Respect the caller-provided temp dir if set, otherwise fall back to
   // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
@@ -373,12 +380,18 @@ export function generateProxyEnvVars(
       envVars.push(
         `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
-    } else if (platform === 'linux' && httpProxyPort) {
-      // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
-      // socat is already a required Linux sandbox dependency, and PROXY: is
-      // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
+    } else if (platform === 'linux' && httpProxyPort && launcherPath) {
+      // Linux: use srt-launcher's HTTP CONNECT helper via the in-sandbox
+      // HTTP relay. ssh execs this as ProxyCommand inside the sandbox netns.
+      // The launcher validates %h/%p (which derive from the git remote URL)
+      // before splicing them into the CONNECT request line; the proxy on the
+      // other end of the relay applies the allow/deny filter.
+      const quotedLauncher = launcherPath.includes("'")
+        ? // ssh ProxyCommand is single-quoted; escape any embedded quote.
+          launcherPath.replace(/'/g, "'\\''")
+        : launcherPath
       envVars.push(
-        `GIT_SSH_COMMAND=ssh -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
+        `GIT_SSH_COMMAND=ssh -o ProxyCommand='${quotedLauncher} connect %h %p --proxy 127.0.0.1:${httpProxyPort}'`,
       )
     }
 
