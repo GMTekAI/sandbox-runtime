@@ -109,8 +109,10 @@ pub fn loopback_up() {
 // ---------------------------------------------------------------------------
 // In-sandbox relay: TCP-LISTEN:port -> UNIX-CONNECT:path
 //
-// Forked from PID 1 inside the netns, before seccomp, with DUMPABLE=0
-// inherited. Replaces `socat TCP-LISTEN:PORT,fork UNIX-CONNECT:PATH`.
+// Forked from the *stub* in {host pidns, host mountns, sandbox netns}, with
+// DUMPABLE=0 inherited. The workload has no PID for it, and it resolves
+// `unix_path` in the host's mount view. Replaces `socat TCP-LISTEN:PORT,fork
+// UNIX-CONNECT:PATH`.
 // ---------------------------------------------------------------------------
 
 pub struct RelaySpec {
@@ -118,17 +120,28 @@ pub struct RelaySpec {
     pub unix_path: String,
 }
 
-pub fn relay_fork(spec: &RelaySpec) {
+pub fn relay_fork(spec: &RelaySpec) -> libc::pid_t {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         die_errno!("fork relay");
     }
     if pid == 0 {
-        // New process group so a Ctrl-C aimed at the worker doesn't take the
-        // relay with it. PID 1 tears it down on exit.
-        unsafe { libc::setpgid(0, 0) };
+        unsafe {
+            // Own process group so the stub's kill(-pid, SIGKILL) reaches our
+            // per-connection children too.
+            libc::setpgid(0, 0);
+            // We're outside the sandbox pidns, so pidns-teardown doesn't reach
+            // us. Die with the stub instead.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // The stub couldn't set DUMPABLE=0 before forking us (it needs to
+            // write /proc/self/{uid,gid}_map after). Set it ourselves.
+            libc::prctl(libc::PR_SET_DUMPABLE, 0);
+        }
+        // The relay never needs caps; drop them before doing anything else.
+        crate::run::drop_all_caps();
         relay_serve_tcp_to_unix(spec.port, &spec.unix_path);
     }
+    pid
 }
 
 fn relay_serve_tcp_to_unix(port: u16, unix_path: &str) -> ! {
@@ -136,6 +149,22 @@ fn relay_serve_tcp_to_unix(port: u16, unix_path: &str) -> ! {
         Ok(l) => l,
         Err(e) => die!("relay: bind 127.0.0.1:{port}: {e}"),
     };
+
+    // Pin the bridge socket *inode* now, before the workload exists. The
+    // workload may have rw access to the socket's directory via a bind mount
+    // (writes to a bound path land on the same host filesystem); without this
+    // it could swap `unix_path` to a symlink at, say, /var/run/docker.sock and
+    // the relay — which has AF_UNIX capability the workload lacks — would
+    // connect there on its behalf. /proc/self/fd/N resolves directly to the
+    // inode this fd refers to, regardless of what the path now points at.
+    let sock_path_c = std::ffi::CString::new(unix_path)
+        .unwrap_or_else(|_| die!("relay: unix path contains NUL"));
+    let sock_fd = unsafe { libc::open(sock_path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if sock_fd < 0 {
+        die_errno!("relay: open(O_PATH) {unix_path}");
+    }
+    let pinned_path = format!("/proc/self/fd/{sock_fd}");
+
     install_nocldwait_sigpipe_ign();
 
     for conn in listener.incoming() {
@@ -149,9 +178,12 @@ fn relay_serve_tcp_to_unix(port: u16, unix_path: &str) -> ! {
             continue;
         }
         if pid == 0 {
+            // PDEATHSIG was cleared by fork; re-set so a stuck connection
+            // child doesn't outlive the listener.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
             drop(listener);
             let _ = client.set_nodelay(true);
-            if let Ok(upstream) = UnixStream::connect(unix_path) {
+            if let Ok(upstream) = UnixStream::connect(&pinned_path) {
                 let cfd = client.as_raw_fd();
                 let ufd = upstream.as_raw_fd();
                 splice_loop(cfd, ufd, ufd, cfd);

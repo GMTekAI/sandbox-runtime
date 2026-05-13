@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
+import { existsSync, mkdtempSync, chmodSync, rmSync } from 'node:fs'
+import * as net from 'node:net'
 import { getSrtLauncherPath } from '../../src/sandbox/srt-launcher.js'
 import { isLinux } from '../helpers/platform.js'
 
@@ -142,4 +144,105 @@ describe.if(isLinux)('srt-launcher isolation', () => {
     expect(r.status).toBe(0)
     expect(r.stdout).toContain('ok')
   })
+})
+
+describe.if(isLinux)('relay isolation (host pidns)', () => {
+  let sockDir: string
+  let hsock: string
+  let proxy: net.Server
+
+  beforeAll(() => {
+    launcher = getSrtLauncherPath()
+    if (!launcher || !existsSync(launcher)) {
+      throw new Error(
+        'srt-launcher binary not found; run `npm run build:launcher`',
+      )
+    }
+    sockDir = mkdtempSync('/tmp/srt-relay-iso-')
+    chmodSync(sockDir, 0o700)
+    hsock = `${sockDir}/http.sock`
+  })
+
+  /** spawn (not spawnSync) — the proxy listeners are on this event loop. */
+  async function runLauncherAsync(argv: string[]): Promise<string> {
+    const p = spawn(launcher!, argv)
+    let out = ''
+    p.stdout.on('data', d => (out += d))
+    await once(p, 'exit')
+    return out.trim()
+  }
+
+  it('relay survives `kill -9 -1` from inside the sandbox pidns', async () => {
+    proxy = net.createServer(c => c.once('data', d => c.end('via-relay:' + d)))
+    await new Promise<void>(r => proxy.listen(hsock, () => r()))
+
+    // Worker does `kill -9 -1` (every process in its pidns), then connects to
+    // the relay. If the relay were inside the pidns, it would be dead.
+    const out = await runLauncherAsync([
+      'run',
+      '--unshare-net',
+      '--ro-bind',
+      '/',
+      '/',
+      '--bind',
+      '/tmp',
+      '/tmp',
+      '--proc',
+      '/proc',
+      '--dev',
+      '/dev',
+      '--relay',
+      '3128',
+      hsock,
+      '--',
+      '/bin/sh',
+      '-c',
+      'sleep 0.3; kill -9 -1 2>/dev/null; sleep 0.2; ' +
+        "python3 -c \"import socket;c=socket.create_connection(('127.0.0.1',3128),timeout=3);c.sendall(b'hi');print(c.recv(64).decode())\"",
+    ])
+    proxy.close()
+    rmSync(hsock, { force: true })
+    expect(out).toBe('via-relay:hi')
+  }, 10000)
+
+  it('relay pins the bridge socket inode — workload cannot redirect it', async () => {
+    const evil = `${sockDir}/evil.sock`
+    rmSync(hsock, { force: true })
+    rmSync(evil, { force: true })
+
+    const good = net.createServer(c => c.end('GOOD'))
+    const bad = net.createServer(c => c.end('PWNED'))
+    await new Promise<void>(r => good.listen(hsock, () => r()))
+    await new Promise<void>(r => bad.listen(evil, () => r()))
+
+    // Worker swaps the socket path to a symlink at the "evil" socket. The
+    // relay opened an O_PATH fd to the real socket before the worker existed,
+    // so its connect goes to the original inode regardless.
+    const out = await runLauncherAsync([
+      'run',
+      '--unshare-net',
+      '--ro-bind',
+      '/',
+      '/',
+      '--bind',
+      '/tmp',
+      '/tmp',
+      '--proc',
+      '/proc',
+      '--dev',
+      '/dev',
+      '--relay',
+      '3128',
+      hsock,
+      '--',
+      '/bin/sh',
+      '-c',
+      `sleep 0.3; rm '${hsock}' && ln -s '${evil}' '${hsock}'; ` +
+        'python3 -c "import socket;c=socket.create_connection((\'127.0.0.1\',3128),timeout=3);print(c.recv(64).decode())"',
+    ])
+    good.close()
+    bad.close()
+    rmSync(sockDir, { recursive: true, force: true })
+    expect(out).toBe('GOOD')
+  }, 10000)
 })

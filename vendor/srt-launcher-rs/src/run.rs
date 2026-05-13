@@ -2,22 +2,28 @@
 //!
 //! Process tree (one wrapped command, network restrictions on):
 //!
-//!   srt-launcher run [stub]            host pid ns; waits, forwards signals
-//!   ═══════════════════════════════════ user/mount/pid[/net] ns boundary
-//!   └─ srt-launcher run [PID 1]        DUMPABLE=0; pivot_root; reaper
-//!      ├─ relay (3128)                 DUMPABLE=0 inherited; no seccomp
-//!      ├─ relay (1080)                 DUMPABLE=0 inherited; no seccomp
+//!   srt-launcher run [stub]            host pidns/mountns, sandbox netns
+//!   │   NO_NEW_PRIVS; PDEATHSIG; DUMPABLE=0
+//!   │   unshare(USER?|NET) → lo up → fork relays → unshare(NS|PID) → fork
+//!   ├─ relay (3128)                    host pidns/mountns, sandbox netns
+//!   ├─ relay (1080)                    (same — invisible to the workload)
+//!   ══════════════════════════════════ mount + PID ns boundary
+//!   └─ srt-launcher run [PID 1]        sandbox pidns/mountns; pivot_root; reaper
 //!      └─ worker                       seccomp applied, then execvp
 //!
-//! There is no nested PID namespace. apply-seccomp needed one to hide bwrap's
-//! init (which we didn't control) from the seccomp'd worker; here PID 1 and
-//! the relays are all our own forks with PR_SET_DUMPABLE=0 set before any of
-//! them is created, so the worker can't ptrace or write /proc/N/mem against
-//! them regardless of kernel.yama.ptrace_scope. One namespace layer.
+//! The relays fork from the stub *between* the NET unshare and the NS|PID
+//! unshare, so they're in the host pidns and host mountns but the sandbox
+//! netns: they listen on the sandbox's loopback yet the workload has no PID
+//! for them (kill/ptrace/ /proc all return ESRCH/ENOENT), and they resolve
+//! the bridge unix-socket path in the host's mount view (the workload cannot
+//! swap that path). DUMPABLE=0 is inherited as defense-in-depth for the
+//! `--host-proc` mode where they're visible at host PIDs.
 //!
-//! PID-namespace, session, and parent-death-signal isolation are not optional
-//! and not flag-gated: the PID-1/reaper architecture and the TIOCSTI defense
-//! are correctness properties of the sandbox, not tunables.
+//! Three processes (stub → PID 1 → worker) is the floor: unshare(CLONE_NEWPID)
+//! requires a fork to enter, and execve resets signal handlers — so a PID 1
+//! that *is* the workload can't receive SIGTERM. PID-namespace, session, and
+//! parent-death-signal isolation are not flag-gated; they're correctness
+//! properties.
 
 use crate::mount::{self, MountOp};
 use crate::net::{self, RelaySpec};
@@ -171,18 +177,32 @@ fn write_file(path: &str, content: &str) {
     }
 }
 
-fn enter_namespaces(c: &Config) {
+/// Namespace entry happens in two phases so the relays can fork in between:
+///
+///   phase 1 (USER? + NET):  relays land in the host pidns/mountns but the
+///                           sandbox netns — they listen on the sandbox's
+///                           loopback yet are structurally invisible to the
+///                           workload (no PID, no /proc entry).
+///   phase 2 (NS + PID):     PID 1 (and thus the workload) gets the fresh
+///                           mount + PID namespaces.
+///
+/// Phase 1 also handles the optional userns: try the direct unshare first
+/// (succeeds with CAP_SYS_ADMIN), fall back to a userns to acquire it.
+/// `force_userns` (the --unshare-user flag) takes the userns path even at
+/// EUID 0, for unprivileged-container hosts.
+fn enter_net_namespace(unshare_net: bool, force_userns: bool) {
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
-    // Try direct unshare first (succeeds when we already have CAP_SYS_ADMIN).
-    // Otherwise create a user namespace to get it. unshare_user forces the
-    // userns path even at EUID 0, for unprivileged-container hosts.
-    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWPID;
-    if c.unshare_net {
-        flags |= libc::CLONE_NEWNET;
+    let flags = if unshare_net { libc::CLONE_NEWNET } else { 0 };
+    // Even if there's no NET to unshare, we may still need the userns for the
+    // phase-2 NS|PID unshare. Probe with a no-op (flags=0 → unshare succeeds
+    // trivially) only when forced; otherwise defer the userns decision to the
+    // first actual unshare.
+    if flags == 0 && !force_userns {
+        return;
     }
 
-    let need_userns = c.unshare_user || unsafe { libc::unshare(flags) } < 0;
+    let need_userns = force_userns || unsafe { libc::unshare(flags) } < 0;
     if need_userns {
         if unsafe { libc::unshare(libc::CLONE_NEWUSER) } < 0 {
             die_errno!("unshare(CLONE_NEWUSER)");
@@ -192,9 +212,26 @@ fn enter_namespaces(c: &Config) {
         write_file("/proc/self/setgroups", "deny");
         write_file("/proc/self/uid_map", &format!("{uid} {uid} 1\n"));
         write_file("/proc/self/gid_map", &format!("{gid} {gid} 1\n"));
-        if unsafe { libc::unshare(flags) } < 0 {
-            die_errno!("unshare(NS|PID|NET) after userns");
+        if flags != 0 && unsafe { libc::unshare(flags) } < 0 {
+            die_errno!("unshare(CLONE_NEWNET) after userns");
         }
+    }
+}
+
+fn enter_mount_pid_namespaces() {
+    if unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) } >= 0 {
+        return;
+    }
+    // Phase 1 didn't take a userns (no NET, not forced). Take it now.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } < 0 {
+        die_errno!("unshare(CLONE_NEWUSER)");
+    }
+    write_file("/proc/self/setgroups", "deny");
+    write_file("/proc/self/uid_map", &format!("{uid} {uid} 1\n"));
+    write_file("/proc/self/gid_map", &format!("{gid} {gid} 1\n"));
+    if unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) } < 0 {
+        die_errno!("unshare(CLONE_NEWNS|CLONE_NEWPID) after userns");
     }
 }
 
@@ -214,7 +251,7 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 /// bounding + ambient sets so execve can't recover any. NO_NEW_PRIVS is
 /// already set at the top of `main`, so file caps / setuid can't restore
 /// them either.
-fn drop_all_caps() {
+pub(crate) fn drop_all_caps() {
     unsafe {
         // Clear ambient set wholesale.
         libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
@@ -302,19 +339,53 @@ pub fn main(args: Vec<String>) -> ExitCode {
     let c = parse(args);
 
     // Set NO_NEW_PRIVS first (bwrap parity), so it's inherited by every
-    // subsequent fork — PID 1, the relays, and the worker. unshare(NEWUSER)
+    // subsequent fork — the relays, PID 1, and the worker. unshare(NEWUSER)
     // still grants caps in the new userns regardless; this only blocks
     // setuid/setgid/file-cap escalation on exec, which we never want.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         die_errno!("prctl(PR_SET_NO_NEW_PRIVS)");
     }
     // Die with the parent so we don't orphan a sandbox tree if the host
-    // process crashes. Set on the outer stub here and again on PID 1 below.
+    // process crashes. Set on the stub here and again on PID 1 below.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
         die_errno!("prctl(PR_SET_PDEATHSIG)");
     }
 
-    enter_namespaces(&c);
+    // ---- Phase 1: USER? + NET. Relays fork here, before NS|PID. ----
+    // DUMPABLE stays 1 across both namespace phases: writing
+    // /proc/self/{setgroups,uid_map,gid_map} requires the files be owned by
+    // us, and with DUMPABLE=0 they're root-owned. The relays and PID 1 set
+    // DUMPABLE=0 themselves immediately after fork.
+    enter_net_namespace(c.unshare_net, c.unshare_user);
+
+    let mut relay_pids: Vec<libc::pid_t> = Vec::with_capacity(c.relays.len());
+    if c.unshare_net {
+        // lo must be up for the relay to bind 127.0.0.1; the stub holds the
+        // netns so this carries through to PID 1 and the worker.
+        net::loopback_up();
+        // Relays fork now: {host pidns, host mountns, sandbox netns}. The
+        // workload has no PID for them (they're outside its pidns), and they
+        // resolve the bridge unix-socket path in the *host* mountns — the
+        // workload cannot swap that path. They inherit DUMPABLE=0. They run
+        // without seccomp (they need socket(AF_UNIX)); their caps are dropped
+        // inside relay_fork.
+        for r in &c.relays {
+            relay_pids.push(net::relay_fork(r));
+        }
+    }
+
+    // ---- Phase 2: NS + PID. ----
+    enter_mount_pid_namespaces();
+
+    // DUMPABLE=0 from here protects the stub and is inherited by PID 1.
+    // (Set after the userns map writes, which need /proc/self/* to be owned
+    // by us.) The relays set it themselves in relay_fork. The relays and stub
+    // live in the *host* pidns, so the workload has no PID for them —
+    // DUMPABLE=0 is defense-in-depth for the --host-proc case where they're
+    // visible at host PIDs.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } < 0 {
+        die_errno!("prctl(PR_SET_DUMPABLE)");
+    }
 
     // Fork: parent stays in the host PID ns as the stub; child is PID 1 in
     // the new PID ns (unshare(CLONE_NEWPID) puts *children*, not us, there).
@@ -323,36 +394,31 @@ pub fn main(args: Vec<String>) -> ExitCode {
         die_errno!("fork (PID 1)");
     }
     if pid1 > 0 {
-        // ---- outer stub: forward signals, wait for PID 1. ----
+        // ---- stub: forward signals to PID 1, reap relays + PID 1. ----
         install_forwarders(pid1);
-        let mut status = 0;
-        loop {
-            let r = unsafe { libc::waitpid(pid1, &mut status, 0) };
-            if r < 0 && errno() == libc::EINTR {
-                continue;
-            }
-            if r < 0 {
-                return ExitCode::FAILURE;
-            }
-            break;
+        drop_all_caps();
+        // The stub now has both relays and pid1 as children; reap_until
+        // collects whichever exits first and returns when pid1 does.
+        let code = reap_until(pid1);
+        // Relays don't get the kernel's pidns-teardown SIGKILL (they're in
+        // the host pidns). Tear them down explicitly. Each relay setpgid'd
+        // itself, so kill(-pid) reaches its per-connection children too.
+        for pid in relay_pids {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
-        return ExitCode::from(wait_status_to_code(status) as u8);
+        return ExitCode::from(code as u8);
     }
 
     // =======================================================================
     // PID 1 in the sandbox.
     // =======================================================================
 
-    // Block ptrace and /proc/1/mem writes against this process and every
-    // child forked from here (relays). This is what makes the single-layer
-    // architecture safe without apply-seccomp's nested PID namespace.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } < 0 {
-        die_errno!("prctl(PR_SET_DUMPABLE)");
-    }
+    // Inherited DUMPABLE=0 from the stub blocks ptrace and /proc/1/mem
+    // writes against this process. PDEATHSIG was cleared by fork; re-set it.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
     // setsid drops the controlling terminal — the TIOCSTI defense. Runs
-    // before forking so the relays and worker share the new session.
+    // before forking so the worker shares the new session.
     if unsafe { libc::setsid() } < 0 {
         die_errno!("setsid");
     }
@@ -362,24 +428,14 @@ pub fn main(args: Vec<String>) -> ExitCode {
     // inherit the caller's cwd if it survives the mount setup, else land in /.
     let spawn_cwd = std::env::current_dir().ok();
 
-    // Filesystem setup happens before relays/worker so they all see the
-    // pivoted root.
+    // Filesystem setup happens here so PID 1 (which mounts /proc) is in the
+    // pidns whose process list /proc should reflect.
     mount::setup_filesystem(&c.ops);
 
     // Restore cwd best-effort; if the path doesn't exist inside the sandbox,
     // we stay in / (where setup_filesystem left us).
     if let Some(cwd) = spawn_cwd {
         let _ = std::env::set_current_dir(&cwd);
-    }
-
-    if c.unshare_net {
-        net::loopback_up();
-    }
-
-    // Fork relays. They inherit DUMPABLE=0. They run *without* seccomp — they
-    // need socket(AF_UNIX) to reach the host bridge socket.
-    for r in &c.relays {
-        net::relay_fork(r);
     }
 
     // Fork the worker so PID 1 stays as a non-dumpable reaper.
