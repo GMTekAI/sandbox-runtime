@@ -16,9 +16,10 @@
 //! brings every submount along — each needing its own remount. We walk
 //! /proc/self/mountinfo for that, same as bwrap.
 
-use crate::{die, die_errno, errno_str};
-use std::ffi::CString;
+use crate::{die, die_errno, errno};
+use std::ffi::{CStr, CString};
 use std::fs;
+use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::ptr;
@@ -27,7 +28,6 @@ const BASE: &str = "/tmp";
 const OLDROOT: &str = "/oldroot";
 const NEWROOT: &str = "/newroot";
 
-#[derive(Clone)]
 pub enum MountOp {
     Bind { src: String, dst: String },
     RoBind { src: String, dst: String },
@@ -40,12 +40,16 @@ pub enum MountOp {
     Proc { dst: String, host: bool },
 }
 
-bitflags_lite! {
-    pub struct BindFlags: u32 {
-        const READONLY = 1 << 0;
-        // DEVICES: don't add nodev — the /dev/* nodes are device nodes.
-        const DEVICES  = 1 << 1;
-    }
+/// What `do_bind` adds on top of the recursive bind. The variants are
+/// disjoint — they're never combined — so a flags type is overkill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    /// rw + nosuid + nodev (the default `--bind`).
+    Rw,
+    /// ro + nosuid + nodev (`--ro-bind`).
+    Ro,
+    /// rw + nosuid only — for the `/dev/*` device-node binds.
+    Dev,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +66,7 @@ fn mount(
     fstype: Option<&str>,
     flags: libc::c_ulong,
     data: Option<&str>,
-) -> Result<(), ()> {
+) -> Result<(), i32> {
     let src_c = src.map(cstr);
     let tgt_c = cstr(target);
     let fst_c = fstype.map(cstr);
@@ -76,7 +80,7 @@ fn mount(
             dat_c.as_ref().map_or(ptr::null(), |c| c.as_ptr().cast()),
         )
     };
-    if r < 0 { Err(()) } else { Ok(()) }
+    if r < 0 { Err(errno()) } else { Ok(()) }
 }
 
 fn mount_or_die(src: Option<&str>, target: &str, fstype: Option<&str>, flags: libc::c_ulong, data: Option<&str>, what: &str) {
@@ -184,7 +188,8 @@ fn for_each_mount_under(proc_fd: RawFd, root: &str, mut f: impl FnMut(&str, libc
             die!("read mountinfo: {e}");
         }
     }
-    let root_slash = if root == "/" { "/".to_string() } else { format!("{root}/") };
+    // Both callers pass paths under /newroot — root is never "/".
+    let root_slash = format!("{root}/");
     for line in info.lines() {
         // Field 5 = mountpoint, field 6 = per-mount options. Fields are
         // space-separated; mountinfo escapes spaces inside paths.
@@ -215,13 +220,7 @@ fn ensure_dst(dst: &str, is_dir: bool) {
     // existing dir requires write permission on the parent — neither of which
     // we have when the dest is inside an already-ro bind. bwrap's
     // ensure_file/ensure_dir do the same lstat-then-skip.
-    if let Ok(md) = fs::symlink_metadata(p) {
-        // A pre-existing symlink at the dest is fine if it points at the right
-        // kind of thing (the kernel will mount over the symlink itself, not
-        // its target, but creating a mount-point file behind a symlink would
-        // EEXIST). Don't try to "fix" the kind; the mount() call will fail
-        // loud if the kind is wrong.
-        let _ = md;
+    if fs::symlink_metadata(p).is_ok() {
         return;
     }
     if let Some(parent) = p.parent() {
@@ -248,7 +247,7 @@ fn ensure_dst(dst: &str, is_dir: bool) {
 // Mount ops
 // ---------------------------------------------------------------------------
 
-fn do_bind(proc_fd: RawFd, src: &str, dst: &str, bf: BindFlags) {
+fn do_bind(proc_fd: RawFd, src: &str, dst: &str, kind: BindKind) {
     let real_src = prefix_path(OLDROOT, src);
     let real_dst = prefix_path(NEWROOT, dst);
 
@@ -274,11 +273,14 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, bf: BindFlags) {
     // MS_BIND ignores MS_RDONLY/MS_NOSUID/MS_NODEV — they only take effect on
     // MS_REMOUNT. A recursive bind brings submounts along, each needing its
     // own remount. Mirrors bwrap's bind_mount(): always nosuid; nodev unless
-    // BIND_DEVICES; rdonly when requested. Compute new = current | add and
-    // skip when nothing would change.
+    // binding device nodes; rdonly when requested. Compute new = current | add
+    // and skip when nothing would change.
     let add = libc::MS_NOSUID
-        | if bf.contains(BindFlags::DEVICES) { 0 } else { libc::MS_NODEV }
-        | if bf.contains(BindFlags::READONLY) { libc::MS_RDONLY } else { 0 };
+        | match kind {
+            BindKind::Rw => libc::MS_NODEV,
+            BindKind::Ro => libc::MS_NODEV | libc::MS_RDONLY,
+            BindKind::Dev => 0,
+        };
 
     let mut first = true;
     for_each_mount_under(proc_fd, &real_dst, |mp, cur| {
@@ -288,8 +290,7 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, bf: BindFlags) {
         if new == cur {
             return;
         }
-        if mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None).is_err() {
-            let errno = unsafe { *libc::__errno_location() };
+        if let Err(e) = mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None) {
             // EACCES: a mount we can't read can't be reached by the sandbox
             // either, so there's nothing to harden. EINVAL/ENOENT: a submount
             // raced away between mountinfo and remount.
@@ -301,10 +302,10 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, bf: BindFlags) {
             // than the host. (runc/crun tolerate this for the same reason.)
             // EPERM on the bind root itself stays fatal: that's the mount we
             // just created and own; if it won't remount, the bind didn't take.
-            let tolerated = errno == libc::EINVAL
-                || errno == libc::ENOENT
-                || errno == libc::EACCES
-                || (errno == libc::EPERM && !is_root);
+            let tolerated = e == libc::EINVAL
+                || e == libc::ENOENT
+                || e == libc::EACCES
+                || (e == libc::EPERM && !is_root);
             if !tolerated {
                 die_errno!("remount {mp}");
             }
@@ -386,14 +387,14 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
         &format!("mount tmpfs {real_dst}"),
     );
 
-    // Bind the basic device nodes from the host. BIND_DEVICES: nosuid yes,
+    // Bind the basic device nodes from the host. BindKind::Dev: nosuid yes,
     // nodev no — these ARE device nodes.
     for n in &["null", "zero", "full", "random", "urandom", "tty"] {
         let host_src = format!("{OLDROOT}/dev/{n}");
         if !Path::new(&host_src).exists() {
             continue; // containers often lack /dev/full; skip absent nodes
         }
-        do_bind(proc_fd, &format!("/dev/{n}"), &format!("{dst}/{n}"), BindFlags::DEVICES);
+        do_bind(proc_fd, &format!("/dev/{n}"), &format!("{dst}/{n}"), BindKind::Dev);
     }
 
     // /dev/stdin etc. → /proc/self/fd/N
@@ -425,16 +426,15 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
 
     // If stdin is a tty, expose it as /dev/console so programs that talk to
     // the controlling terminal by name still work.
-    if unsafe { libc::isatty(0) } == 1 {
-        // c_char is i8 on x86_64 and u8 on aarch64; use libc's alias.
-        let mut buf = [0 as libc::c_char; 256];
-        if unsafe { libc::ttyname_r(0, buf.as_mut_ptr(), buf.len()) } == 0 {
-            let tty = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
+    if std::io::stdin().is_terminal() {
+        let mut buf = [0u8; 256];
+        if unsafe { libc::ttyname_r(0, buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+            let tty = CStr::from_bytes_until_nul(&buf)
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let host_tty = format!("{OLDROOT}{tty}");
             if tty.starts_with("/dev/") && Path::new(&host_tty).exists() {
-                do_bind(proc_fd, &tty, &format!("{dst}/console"), BindFlags::DEVICES);
+                do_bind(proc_fd, &tty, &format!("{dst}/console"), BindKind::Dev);
             }
         }
     }
@@ -483,8 +483,8 @@ pub fn setup_filesystem(ops: &[MountOp]) {
     // first, then layers narrower binds on top.
     for op in ops {
         match op {
-            MountOp::Bind { src, dst } => do_bind(proc_fd, src, dst, BindFlags::empty()),
-            MountOp::RoBind { src, dst } => do_bind(proc_fd, src, dst, BindFlags::READONLY),
+            MountOp::Bind { src, dst } => do_bind(proc_fd, src, dst, BindKind::Rw),
+            MountOp::RoBind { src, dst } => do_bind(proc_fd, src, dst, BindKind::Ro),
             MountOp::Tmpfs { dst } => do_tmpfs(dst),
             MountOp::Dev { dst } => do_dev(proc_fd, dst),
             MountOp::Proc { dst, host } => do_proc(proc_fd, dst, *host),
@@ -528,25 +528,3 @@ pub fn setup_filesystem(ops: &[MountOp]) {
     unsafe { libc::umask(old_umask) };
     drop(proc_dir);
 }
-
-// ---------------------------------------------------------------------------
-// A tiny bitflags so we don't pull in the bitflags crate.
-// ---------------------------------------------------------------------------
-
-macro_rules! bitflags_lite {
-    (pub struct $name:ident : $t:ty { $(const $f:ident = $v:expr;)* }) => {
-        #[derive(Clone, Copy)]
-        pub struct $name($t);
-        #[allow(dead_code)]
-        impl $name {
-            $(pub const $f: Self = Self($v);)*
-            pub const fn empty() -> Self { Self(0) }
-            pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
-        }
-        impl std::ops::BitOr for $name {
-            type Output = Self;
-            fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
-        }
-    };
-}
-use bitflags_lite;

@@ -14,15 +14,20 @@
 //! the relays are all our own forks with PR_SET_DUMPABLE=0 set before any of
 //! them is created, so the worker can't ptrace or write /proc/N/mem against
 //! them regardless of kernel.yama.ptrace_scope. One namespace layer.
+//!
+//! PID-namespace, session, and parent-death-signal isolation are not optional
+//! and not flag-gated: the PID-1/reaper architecture and the TIOCSTI defense
+//! are correctness properties of the sandbox, not tunables.
 
 use crate::mount::{self, MountOp};
 use crate::net::{self, RelaySpec};
-use crate::{die, die_errno, errno_str};
+use crate::{die, die_errno, errno};
 use std::ffi::CString;
 use std::io::Write as _;
 use std::mem::zeroed;
 use std::process::ExitCode;
 use std::ptr;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Config + argv parsing
@@ -30,13 +35,10 @@ use std::ptr;
 
 #[derive(Default)]
 struct Config {
-    new_session: bool,
-    die_with_parent: bool,
     unshare_net: bool,
-    unshare_pid: bool,
-    /// Force --unshare-user even when EUID == 0. Needed in unprivileged
+    /// Force the userns path even when EUID == 0. Needed in unprivileged
     /// containers (Docker default: EUID=0 without CAP_SYS_ADMIN) where direct
-    /// clone EPERMs and the userns path is the only way in.
+    /// unshare EPERMs and the userns path is the only way in.
     unshare_user: bool,
     seccomp_unix: bool,
     ops: Vec<MountOp>,
@@ -45,9 +47,6 @@ struct Config {
     /// argv for the worker. CStrings are built before fork so the post-fork
     /// path doesn't allocate.
     cmd: Vec<CString>,
-    /// chdir target inside the sandbox; defaults to inherited cwd if it
-    /// survives the pivot, else "/".
-    chdir: Option<String>,
 }
 
 fn parse(args: Vec<String>) -> Config {
@@ -60,10 +59,7 @@ fn parse(args: Vec<String>) -> Config {
             };
         }
         match a.as_str() {
-            "--new-session" => c.new_session = true,
-            "--die-with-parent" => c.die_with_parent = true,
             "--unshare-net" => c.unshare_net = true,
-            "--unshare-pid" => c.unshare_pid = true,
             "--unshare-user" => c.unshare_user = true,
             "--seccomp-unix-block" => c.seccomp_unix = true,
             "--bind" => {
@@ -90,7 +86,6 @@ fn parse(args: Vec<String>) -> Config {
                 let v = next!("--setenv");
                 c.env.push((k, v));
             }
-            "--chdir" => c.chdir = Some(next!("--chdir")),
             "--" => {
                 for rest in it.by_ref() {
                     c.cmd.push(CString::new(rest).unwrap_or_else(|_| die!("argv contains NUL")));
@@ -110,25 +105,34 @@ fn parse(args: Vec<String>) -> Config {
 // Signal forwarding + PID-1 reaper
 // ---------------------------------------------------------------------------
 
-static mut FORWARD_TARGET: libc::pid_t = -1;
+static FORWARD_TARGET: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn forward_signal(sig: libc::c_int) {
-    unsafe {
-        if FORWARD_TARGET > 0 {
-            libc::kill(FORWARD_TARGET, sig);
-        }
+    let t = FORWARD_TARGET.load(Ordering::Relaxed);
+    if t > 0 {
+        unsafe { libc::kill(t, sig) };
     }
 }
 
 fn install_forwarders(target: libc::pid_t) {
+    FORWARD_TARGET.store(target, Ordering::Relaxed);
     unsafe {
-        FORWARD_TARGET = target;
         let mut sa: libc::sigaction = zeroed();
         sa.sa_sigaction = forward_signal as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGUSR1, libc::SIGUSR2] {
             libc::sigaction(s, &sa, ptr::null_mut());
         }
+    }
+}
+
+fn wait_status_to_code(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
     }
 }
 
@@ -140,19 +144,13 @@ fn reap_until(main_child: libc::pid_t) -> i32 {
     loop {
         let r = unsafe { libc::waitpid(-1, &mut status, 0) };
         if r < 0 {
-            if unsafe { *libc::__errno_location() } == libc::EINTR {
+            if errno() == libc::EINTR {
                 continue;
             }
             return 1; // ECHILD without seeing main_child — shouldn't happen.
         }
         if r == main_child {
-            return if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                1
-            };
+            return wait_status_to_code(status);
         }
         // Reaped an orphan that died before main_child; keep waiting.
     }
@@ -165,8 +163,8 @@ fn reap_until(main_child: libc::pid_t) -> i32 {
 fn write_file(path: &str, content: &str) {
     match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(mut f) => {
-            if f.write_all(content.as_bytes()).is_err() {
-                die_errno!("write {path}");
+            if let Err(e) = f.write_all(content.as_bytes()) {
+                die!("write {path}: {e}");
             }
         }
         Err(e) => die!("open {path}: {e}"),
@@ -174,15 +172,15 @@ fn write_file(path: &str, content: &str) {
 }
 
 fn enter_namespaces(c: &Config) {
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
     // Try direct unshare first (succeeds when we already have CAP_SYS_ADMIN).
     // Otherwise create a user namespace to get it. unshare_user forces the
     // userns path even at EUID 0, for unprivileged-container hosts.
-    let mut flags = libc::CLONE_NEWNS;
-    if c.unshare_pid { flags |= libc::CLONE_NEWPID }
-    if c.unshare_net { flags |= libc::CLONE_NEWNET }
+    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWPID;
+    if c.unshare_net {
+        flags |= libc::CLONE_NEWNET;
+    }
 
     let need_userns = c.unshare_user || unsafe { libc::unshare(flags) } < 0;
     if need_userns {
@@ -226,22 +224,20 @@ fn drop_all_caps() {
         loop {
             let r = libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
             if r < 0 {
-                let e = *libc::__errno_location();
-                if e == libc::EINVAL { break }
-                if e == libc::EPERM { break } // already dropped or not permitted; fine
-                die_errno!("prctl(PR_CAPBSET_DROP, {cap})");
+                match errno() {
+                    libc::EINVAL | libc::EPERM => break,
+                    _ => die_errno!("prctl(PR_CAPBSET_DROP, {cap})"),
+                }
             }
             cap += 1;
         }
         // Zero effective/permitted/inheritable.
         let hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
         let data = [CapData::default(); 2];
-        if libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) < 0 {
+        if libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) < 0 && errno() != libc::EPERM {
             // Some seccomp policies (systemd-nspawn) deny capset; bwrap
             // tolerates EPERM here for the same reason.
-            if *libc::__errno_location() != libc::EPERM {
-                die_errno!("capset");
-            }
+            die_errno!("capset");
         }
     }
 }
@@ -280,12 +276,10 @@ fn apply_seccomp_unix_block() {
 fn worker_exec(c: &Config) -> ! {
     drop_all_caps();
 
-    // Export env additions. setenv is async-signal-unsafe in the strict POSIX
-    // sense, but we're single-threaded and pre-exec, which is what bwrap does.
+    // Export env additions. set_var is `unsafe` (process-global), but we're
+    // single-threaded and pre-exec — same constraint bwrap satisfies.
     for (k, v) in &c.env {
-        let kc = CString::new(k.as_str()).unwrap();
-        let vc = CString::new(v.as_str()).unwrap();
-        unsafe { libc::setenv(kc.as_ptr(), vc.as_ptr(), 1) };
+        unsafe { std::env::set_var(k, v) };
     }
 
     // NO_NEW_PRIVS was set at the top of run::main and is inherited; the
@@ -314,9 +308,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         die_errno!("prctl(PR_SET_NO_NEW_PRIVS)");
     }
-    // The outer stub also needs --die-with-parent so we don't orphan a whole
-    // sandbox tree if the host process crashes.
-    if c.die_with_parent && unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+    // Die with the parent so we don't orphan a sandbox tree if the host
+    // process crashes. Set on the outer stub here and again on PID 1 below.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
         die_errno!("prctl(PR_SET_PDEATHSIG)");
     }
 
@@ -334,13 +328,15 @@ pub fn main(args: Vec<String>) -> ExitCode {
         let mut status = 0;
         loop {
             let r = unsafe { libc::waitpid(pid1, &mut status, 0) };
-            if r < 0 && unsafe { *libc::__errno_location() } == libc::EINTR { continue }
+            if r < 0 && errno() == libc::EINTR {
+                continue;
+            }
+            if r < 0 {
+                return ExitCode::FAILURE;
+            }
             break;
         }
-        let code = if libc::WIFSIGNALED(status) { 128 + libc::WTERMSIG(status) }
-                   else if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) }
-                   else { 1 };
-        return ExitCode::from(code as u8);
+        return ExitCode::from(wait_status_to_code(status) as u8);
     }
 
     // =======================================================================
@@ -353,13 +349,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } < 0 {
         die_errno!("prctl(PR_SET_DUMPABLE)");
     }
-    if c.die_with_parent {
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-    }
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
 
-    // setsid before forking so the relays and worker share the new session.
-    // This drops the controlling terminal — the TIOCSTI defense.
-    if c.new_session && unsafe { libc::setsid() } < 0 {
+    // setsid drops the controlling terminal — the TIOCSTI defense. Runs
+    // before forking so the relays and worker share the new session.
+    if unsafe { libc::setsid() } < 0 {
         die_errno!("setsid");
     }
 
@@ -372,15 +366,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
     // pivoted root.
     mount::setup_filesystem(&c.ops);
 
-    // Restore cwd. --chdir wins; otherwise the captured spawn-time cwd; if
-    // that path doesn't exist inside the sandbox, fall through to / (which is
-    // where setup_filesystem left us).
-    if let Some(d) = c.chdir.as_deref() {
-        let dc = CString::new(d).unwrap();
-        if unsafe { libc::chdir(dc.as_ptr()) } < 0 {
-            die_errno!("chdir {d}");
-        }
-    } else if let Some(cwd) = spawn_cwd {
+    // Restore cwd best-effort; if the path doesn't exist inside the sandbox,
+    // we stay in / (where setup_filesystem left us).
+    if let Some(cwd) = spawn_cwd {
         let _ = std::env::set_current_dir(&cwd);
     }
 

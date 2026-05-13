@@ -27,7 +27,6 @@ function runLauncher(
     launcher!,
     [
       'run',
-      '--unshare-pid',
       '--ro-bind',
       '/',
       '/',

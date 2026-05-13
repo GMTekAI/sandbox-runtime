@@ -5,11 +5,12 @@
 //! relay bug is a connectivity bug, not a sandbox escape. The seccomp'd worker
 //! cannot ptrace the relay (PR_SET_DUMPABLE=0, set in run.rs before forking).
 
-use crate::{die, die_errno, errno_str};
+use crate::{die, die_errno, errno};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::zeroed;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 
@@ -39,7 +40,7 @@ fn splice_loop(a_in: RawFd, a_out: RawFd, b_in: RawFd, b_out: RawFd) {
     while open > 0 {
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         if r < 0 {
-            if unsafe { *libc::__errno_location() } == libc::EINTR {
+            if errno() == libc::EINTR {
                 continue;
             }
             return;
@@ -67,7 +68,7 @@ fn splice_loop(a_in: RawFd, a_out: RawFd, b_in: RawFd, b_out: RawFd) {
                     libc::write(wfd, buf.as_ptr().add(off as usize).cast(), (n - off) as usize)
                 };
                 if w < 0 {
-                    if unsafe { *libc::__errno_location() } == libc::EINTR {
+                    if errno() == libc::EINTR {
                         continue;
                     }
                     return;
@@ -112,13 +113,12 @@ pub fn loopback_up() {
 // inherited. Replaces `socat TCP-LISTEN:PORT,fork UNIX-CONNECT:PATH`.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
 pub struct RelaySpec {
     pub port: u16,
     pub unix_path: String,
 }
 
-pub fn relay_fork(spec: &RelaySpec) -> libc::pid_t {
+pub fn relay_fork(spec: &RelaySpec) {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         die_errno!("fork relay");
@@ -129,7 +129,6 @@ pub fn relay_fork(spec: &RelaySpec) -> libc::pid_t {
         unsafe { libc::setpgid(0, 0) };
         relay_serve_tcp_to_unix(spec.port, &spec.unix_path);
     }
-    pid
 }
 
 fn relay_serve_tcp_to_unix(port: u16, unix_path: &str) -> ! {
@@ -226,10 +225,9 @@ pub fn relay_main(args: Vec<String>) -> ExitCode {
     // "Listening" handshake: one byte to ready_fd, then close it. Replaces the
     // "spawn socat, then poll fs.existsSync(socketPath) with backoff" loop.
     if let Some(fd) = ready_fd {
-        unsafe {
-            libc::write(fd, [0u8].as_ptr().cast(), 1);
-            libc::close(fd);
-        }
+        // Ownership of the fd was passed in by the spawner via --ready-fd; we
+        // close it here (File's drop). The unsafe is the ownership assertion.
+        let _ = unsafe { File::from_raw_fd(fd) }.write_all(&[0u8]);
     }
 
     install_nocldwait_sigpipe_ign();
@@ -255,28 +253,25 @@ pub fn relay_main(args: Vec<String>) -> ExitCode {
             unsafe { libc::_exit(0) };
         }
     }
-    ExitCode::SUCCESS
+    unreachable!("UnixListener::incoming() is infinite")
 }
 
-/// Parse `HOST:PORT` where HOST is a literal IPv4 address or "localhost". No
-/// DNS — the external proxy is configured by port and runs on the same host;
-/// resolving here would be an extra moving part on the host data path.
+/// Parse `HOST:PORT` where HOST is a literal IPv4 address. No DNS — the
+/// external proxy is configured by port and runs on the same host; resolving
+/// here would be an extra moving part on the host data path.
 fn parse_tcp_target(spec: &str) -> (Ipv4Addr, u16) {
     let (h, p) = spec
         .rsplit_once(':')
-        .unwrap_or_else(|| die!("relay: bad TCP target {spec}"));
-    let host: Ipv4Addr = if h == "localhost" {
-        Ipv4Addr::LOCALHOST
-    } else {
-        h.parse()
-            .unwrap_or_else(|_| die!("relay: TCP host must be a literal IPv4 address or 'localhost'"))
-    };
-    let port: u16 = p.parse().unwrap_or_else(|_| die!("relay: bad TCP port {p}"));
+        .unwrap_or_else(|| die!("bad TCP target {spec}"));
+    let host: Ipv4Addr = h
+        .parse()
+        .unwrap_or_else(|_| die!("TCP host must be a literal IPv4 address: {h}"));
+    let port: u16 = p.parse().unwrap_or_else(|_| die!("bad TCP port {p}"));
     (host, port)
 }
 
 // ---------------------------------------------------------------------------
-// `srt-launcher connect HOST PORT [--proxy ADDR]`
+// `srt-launcher connect HOST PORT --proxy ADDR`
 //
 // HTTP CONNECT helper for ssh ProxyCommand inside the sandbox. Replaces
 // `socat - PROXY:localhost:%h:%p,proxyport=...`.
@@ -285,7 +280,7 @@ fn parse_tcp_target(spec: &str) -> (Ipv4Addr, u16) {
 pub fn connect_main(args: Vec<String>) -> ExitCode {
     let mut target_host: Option<String> = None;
     let mut target_port: Option<u16> = None;
-    let mut proxy = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3128);
+    let mut proxy: Option<SocketAddrV4> = None;
 
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -293,7 +288,7 @@ pub fn connect_main(args: Vec<String>) -> ExitCode {
             "--proxy" => {
                 let v = it.next().unwrap_or_else(|| die!("connect: --proxy needs a value"));
                 let (h, p) = parse_tcp_target(&v);
-                proxy = SocketAddrV4::new(h, p);
+                proxy = Some(SocketAddrV4::new(h, p));
             }
             _ if target_host.is_none() => target_host = Some(a),
             _ if target_port.is_none() => {
@@ -309,6 +304,7 @@ pub fn connect_main(args: Vec<String>) -> ExitCode {
     }
     let host = target_host.unwrap_or_else(|| die!("connect: missing HOST"));
     let port = target_port.unwrap_or_else(|| die!("connect: missing PORT"));
+    let proxy = proxy.unwrap_or_else(|| die!("connect: missing --proxy ADDR"));
 
     // HOST and PORT come from ssh's %h/%p, which derive from the git remote
     // URL — repository-controlled input. We're about to splice them into an

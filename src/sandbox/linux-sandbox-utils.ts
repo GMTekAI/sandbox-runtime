@@ -1009,16 +1009,14 @@ export async function wrapCommandWithSandboxLinux(
   // decrements so the count does not leak.
   activeSandboxCount++
 
-  const args: string[] = ['run', '--new-session', '--die-with-parent']
+  // PID namespace, setsid, and PR_SET_PDEATHSIG are not flag-gated — the
+  // launcher applies them unconditionally (they're correctness properties,
+  // not tunables). /proc is mounted further down, after the filesystem args:
+  // srt-launcher applies mounts in argument order, so a later `--ro-bind / /`
+  // would overmount a /proc placed here and expose the host PID list.
+  const args: string[] = ['run']
 
   try {
-    // ========== PID NAMESPACE ISOLATION ==========
-    // Always unshare PID namespace; without it, the workload can see and
-    // signal host processes. /proc is mounted further down, after the
-    // filesystem args — srt-launcher applies mounts in argument order, so a
-    // later `--ro-bind / /` would overmount a /proc placed here and expose
-    // the host PID list.
-    args.push('--unshare-pid')
     if (enableWeakerNestedSandbox) {
       // Unprivileged-container mode: --unshare-user forces the userns path so
       // the launcher gets the caps it needs for the other unshares.

@@ -9,7 +9,7 @@
 //!       Host-side Unix→TCP bridge to an external proxy. Used only when
 //!       network.{http,socks}ProxyPort is configured; the internal proxy
 //!       listens on the unix socket directly.
-//!   connect HOST PORT [--proxy ADDR]
+//!   connect HOST PORT --proxy ADDR
 //!       HTTP CONNECT helper for ssh ProxyCommand inside the sandbox.
 //!
 //! Design notes that apply throughout:
@@ -26,7 +26,6 @@ mod net;
 mod run;
 
 use std::env;
-use std::ffi::CStr;
 use std::process::ExitCode;
 
 /// Abort with a message on stderr. Uses libc `_exit` so no atexit/drop runs —
@@ -41,27 +40,25 @@ macro_rules! die {
 
 /// Like die!, with `: <strerror(errno)>` appended.
 macro_rules! die_errno {
-    ($($arg:tt)*) => {{
-        let e = errno_str();
-        eprintln!("srt-launcher: {}: {}", format_args!($($arg)*), e);
-        #[allow(unused_unsafe)]
-        unsafe { libc::_exit(1) }
-    }};
+    ($($arg:tt)*) => {
+        $crate::die!("{}: {}", format_args!($($arg)*), ::std::io::Error::last_os_error())
+    };
 }
 
 pub(crate) use {die, die_errno};
 
-pub(crate) fn errno_str() -> String {
-    let e = unsafe { *libc::__errno_location() };
-    let s = unsafe { CStr::from_ptr(libc::strerror(e)) };
-    s.to_string_lossy().into_owned()
+/// Current errno as a plain i32. std's `last_os_error()` covers display; this
+/// is for the few places that need to compare against a specific E* constant.
+#[inline]
+pub(crate) fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: srt-launcher run [opts] -- COMMAND [ARGS...]\n       \
          srt-launcher relay [--ready-fd N] UNIX_SOCKET TCP_HOST:PORT\n       \
-         srt-launcher connect HOST PORT [--proxy ADDR]"
+         srt-launcher connect HOST PORT --proxy ADDR"
     );
     std::process::exit(2)
 }
