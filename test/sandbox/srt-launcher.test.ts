@@ -15,18 +15,21 @@ describe('getSrtLauncherPath', () => {
     _resetSrtLauncherCache()
   })
 
-  it('resolves the vendored binary on x64/arm64', () => {
-    const arch = process.arch
-    if (arch !== 'x64' && arch !== 'arm64') {
-      expect(getSrtLauncherPath()).toBeNull()
-      return
-    }
+  it.if(isLinux)(
+    'resolves the vendored binary on x64/arm64 (Linux only — the binary is not built or shipped on macOS)',
+    () => {
+      const arch = process.arch
+      if (arch !== 'x64' && arch !== 'arm64') {
+        expect(getSrtLauncherPath()).toBeNull()
+        return
+      }
 
-    const binaryPath = getSrtLauncherPath()
-    expect(binaryPath).toBeTruthy()
-    expect(existsSync(binaryPath!)).toBe(true)
-    expect(binaryPath).toContain(`vendor/srt-launcher/${arch}/`)
-  })
+      const binaryPath = getSrtLauncherPath()
+      expect(binaryPath).toBeTruthy()
+      expect(existsSync(binaryPath!)).toBe(true)
+      expect(binaryPath).toContain(`vendor/srt-launcher/${arch}/`)
+    },
+  )
 
   it('returns an explicit valid path verbatim', () => {
     const real = getSrtLauncherPath()

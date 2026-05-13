@@ -280,17 +280,32 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, bf: BindFlags) {
         | if bf.contains(BindFlags::DEVICES) { 0 } else { libc::MS_NODEV }
         | if bf.contains(BindFlags::READONLY) { libc::MS_RDONLY } else { 0 };
 
+    let mut first = true;
     for_each_mount_under(proc_fd, &real_dst, |mp, cur| {
+        let is_root = first && mp == real_dst;
+        first = false;
         let new = cur | add;
         if new == cur {
             return;
         }
         if mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None).is_err() {
-            // EACCES: a mount we can't read can't be reached by the sandbox
-            // either, so there's nothing to harden (bwrap behavior). EINVAL/
-            // ENOENT: a submount raced away between mountinfo and remount.
             let errno = unsafe { *libc::__errno_location() };
-            if errno != libc::EINVAL && errno != libc::ENOENT && errno != libc::EACCES {
+            // EACCES: a mount we can't read can't be reached by the sandbox
+            // either, so there's nothing to harden. EINVAL/ENOENT: a submount
+            // raced away between mountinfo and remount.
+            //
+            // EPERM on a *submount*: in a userns, mounts inherited from the
+            // parent ns are MNT_LOCKED — the kernel refuses MS_REMOUNT on them
+            // even when we're only adding restrictions. That same lock means
+            // the sandbox can't loosen them either, so skipping is no weaker
+            // than the host. (runc/crun tolerate this for the same reason.)
+            // EPERM on the bind root itself stays fatal: that's the mount we
+            // just created and own; if it won't remount, the bind didn't take.
+            let tolerated = errno == libc::EINVAL
+                || errno == libc::ENOENT
+                || errno == libc::EACCES
+                || (errno == libc::EPERM && !is_root);
+            if !tolerated {
                 die_errno!("remount {mp}");
             }
         }
@@ -411,7 +426,8 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
     // If stdin is a tty, expose it as /dev/console so programs that talk to
     // the controlling terminal by name still work.
     if unsafe { libc::isatty(0) } == 1 {
-        let mut buf = [0i8; 256];
+        // c_char is i8 on x86_64 and u8 on aarch64; use libc's alias.
+        let mut buf = [0 as libc::c_char; 256];
         if unsafe { libc::ttyname_r(0, buf.as_mut_ptr(), buf.len()) } == 0 {
             let tty = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
                 .to_string_lossy()
