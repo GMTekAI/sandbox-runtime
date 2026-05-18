@@ -28,6 +28,63 @@ import {
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
 
+/**
+ * True if `buf` starts with a TLS Handshake record header.
+ *
+ * Three bytes: content type 0x16 (Handshake) + legacy_record_version
+ * 0x03,0x00–0x03. RFC 8446 §5.1 froze the record-layer version (TLS 1.3+
+ * negotiate via the supported_versions extension, the wire header stays
+ * ≤0x0303), so this holds for current and future TLS. Same predicate as
+ * mitmproxy `starts_like_tls_record`; nginx `ssl_preread` routes on byte 0
+ * alone and HAProxy `req.ssl_hello_type` reads 9 bytes to also extract the
+ * handshake type — 3 is the established middle ground for "is this TLS".
+ *
+ * Routing heuristic, not a security check: a non-TLS stream that happens to
+ * start 16 03 0x is handed to the TLS server, which then rejects it properly.
+ */
+export function looksLikeClientHello(buf: Buffer): boolean {
+  return (
+    buf.length >= 3 && buf[0] === 0x16 && buf[1] === 0x03 && buf[2]! <= 0x03
+  )
+}
+
+/**
+ * Wait for the client's first post-CONNECT bytes and report whether they look
+ * like a TLS ClientHello. The caller must already have written the
+ * `200 Connection Established` line — clients don't send until they see it.
+ *
+ * Any bytes consumed here are returned in `.head` so the caller can forward
+ * them to whichever downstream (terminate or opaque tunnel) it picks. The
+ * socket is left paused so further bytes buffer until the downstream
+ * `pipe()` resumes it.
+ */
+export function peekForClientHello(
+  socket: Duplex,
+  head: Buffer,
+): Promise<{ isTLS: boolean; head: Buffer }> {
+  if (head.length >= 3) {
+    return Promise.resolve({ isTLS: looksLikeClientHello(head), head })
+  }
+  return new Promise(resolve => {
+    let buf = head
+    const done = () => {
+      socket.removeListener('data', onData)
+      socket.removeListener('close', done)
+      resolve({ isTLS: looksLikeClientHello(buf), head: buf })
+    }
+    const onData = (chunk: Buffer) => {
+      // Pause synchronously so anything after this chunk buffers for the
+      // downstream pipe() rather than being dropped in flowing mode.
+      socket.pause()
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk
+      if (buf.length >= 3) return done()
+      socket.resume()
+    }
+    socket.on('data', onData)
+    socket.once('close', done)
+  })
+}
+
 export type TerminateTarget = {
   hostname: string
   port: number
@@ -120,9 +177,8 @@ export function terminateAndForward(
       cleanup()
     })
     loop.once('connect', () => {
-      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-      // Any bytes the client sent in the same packet as the CONNECT are the
-      // start of its ClientHello — forward them first.
+      // The caller wrote `200 Connection Established` before sniffing for the
+      // ClientHello; `head` holds whatever the sniff consumed.
       if (head.length) loop.write(head)
       socket.pipe(loop)
       loop.pipe(socket)
