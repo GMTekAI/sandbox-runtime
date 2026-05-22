@@ -66,6 +66,11 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
+          # pwsh does NOT fail the step on a native command's non-zero
+          # exit by default — without this, `cargo test` failing would
+          # be masked by `cargo clippy` exiting 0 on the next line.
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build  --release --manifest-path vendor/srt-win/Cargo.toml
           cargo test   --release --manifest-path vendor/srt-win/Cargo.toml
           cargo clippy --release --manifest-path vendor/srt-win/Cargo.toml --all-targets -- -D warnings

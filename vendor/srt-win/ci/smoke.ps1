@@ -11,14 +11,22 @@
   Usage (CI — workflow passes the path):
     pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
 
-  When running under GitHub Actions, the alt-sublayer GUID is also
-  written to $env:GITHUB_ENV so the always()-gated cleanup step can
-  remove those filters even if this script throws midway.
+  All WFP operations target $TestSublayer (a fixed test GUID), NOT
+  the production default sublayer — safe to run on a dev machine
+  that has real sandbox-runtime filters installed; the idempotent
+  install's purge-then-re-add only touches the test sublayer.
+
+  When running under GitHub Actions, the random alt-sublayer GUID is
+  also written to $env:GITHUB_ENV so the always()-gated cleanup step
+  can remove those filters even if this script throws midway.
 #>
 param(
   [Parameter(Mandatory = $true)]
   [string]$Exe,
-  [string]$GroupName = 'srt-ci-test'
+  [string]$GroupName = 'srt-ci-test',
+  # Distinct from wfp::DEFAULT_SUBLAYER_GUID so local runs never
+  # touch a production install.
+  [string]$TestSublayer = 'a91b6f12-4c0e-4e30-b1f7-3d52890ce117'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,8 +35,11 @@ if (-not (Test-Path $Exe)) {
   throw "srt-win.exe not found at '$Exe'"
 }
 
+# user_sid logged for debug context only (whose TokenGroups the
+# group-status / fence assertions are evaluating against).
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-Write-Host "srt-win smoke: exe=$Exe group=$GroupName user_sid=$me"
+Write-Host "srt-win smoke: exe=$Exe group=$GroupName sublayer=$TestSublayer user_sid=$me"
+$sl = @('--sublayer-guid', $TestSublayer)
 
 function Run([string[]]$argv) {
   & $Exe @argv
@@ -88,22 +99,22 @@ MustFail @('wfp', 'install', '--group-sid', 'not-a-sid') 'invalid --group-sid'
 # ═════════════════════════════════════════════════════════════════════
 
 # ── pre-install absent ───────────────────────────────────────────────
-$pre = J @('wfp', 'status')
+$pre = J (@('wfp', 'status') + $sl)
 if ($pre.state -ne 'absent') {
   throw "pre-install wfp status expected absent, got $($pre.state)"
 }
 
 # First install via --name.
-Run @('wfp', 'install', '--name', $GroupName)
-$ws = J @('wfp', 'status')
+Run (@('wfp', 'install', '--name', $GroupName) + $sl)
+$ws = J (@('wfp', 'status') + $sl)
 Write-Host "wfp status: $($ws | ConvertTo-Json -Compress)"
 if ($ws.state -ne 'installed') { throw "expected installed, got $($ws.state)" }
 if ($ws.filters -lt 8)         { throw "expected >=8 filters, got $($ws.filters)" }
 
 # Idempotency: second install via --group-sid path leaves the same
 # filter count.
-Run @('wfp', 'install', '--group-sid', $gs.sid)
-$ws2 = J @('wfp', 'status')
+Run (@('wfp', 'install', '--group-sid', $gs.sid) + $sl)
+$ws2 = J (@('wfp', 'status') + $sl)
 if ($ws2.filters -ne $ws.filters) {
   throw "idempotency: filter count changed $($ws.filters) -> $($ws2.filters)"
 }
@@ -120,10 +131,10 @@ $alt = J @('wfp', 'status', '--sublayer-guid', $altGuid)
 if ($alt.state -ne 'installed') {
   throw "alt sublayer expected installed, got $($alt.state)"
 }
-# Default sublayer is still its own thing.
-$stillDefault = J @('wfp', 'status')
-if ($stillDefault.filters -ne $ws.filters) {
-  throw "default sublayer perturbed by alt install"
+# Test sublayer is still its own thing.
+$stillTest = J (@('wfp', 'status') + $sl)
+if ($stillTest.filters -ne $ws.filters) {
+  throw "test sublayer perturbed by alt install"
 }
 Run @('wfp', 'uninstall', '--sublayer-guid', $altGuid)
 $altGone = J @('wfp', 'status', '--sublayer-guid', $altGuid)
@@ -131,14 +142,14 @@ if ($altGone.state -ne 'absent') {
   throw "alt sublayer expected absent after uninstall, got $($altGone.state)"
 }
 
-# ── teardown: uninstall on default sublayer ─────────────────────────
-Run @('wfp', 'uninstall')
-$post = J @('wfp', 'status')
+# ── teardown: uninstall on test sublayer ────────────────────────────
+Run (@('wfp', 'uninstall') + $sl)
+$post = J (@('wfp', 'status') + $sl)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
 # Idempotent no-op: second uninstall must also exit 0.
-Run @('wfp', 'uninstall')
+Run (@('wfp', 'uninstall') + $sl)
 
 # ═════════════════════════════════════════════════════════════════════
 # WFP fence-behaviour test — uses BUILTIN\Administrators (S-1-5-32-544).
@@ -151,7 +162,7 @@ Run @('wfp', 'uninstall')
 # ═════════════════════════════════════════════════════════════════════
 
 $adminsSid = 'S-1-5-32-544'
-Run @('wfp', 'install', '--group-sid', $adminsSid)
+Run (@('wfp', 'install', '--group-sid', $adminsSid) + $sl)
 try {
   # Broker-side: this process has Admins enabled, so filter 1
   # (PERMIT group-enabled) should let the connect through.
@@ -167,7 +178,7 @@ try {
   # and assert it is BLOCKED.
 }
 finally {
-  Run @('wfp', 'uninstall')
+  Run (@('wfp', 'uninstall') + $sl)
 }
 
 # ── group teardown ───────────────────────────────────────────────────

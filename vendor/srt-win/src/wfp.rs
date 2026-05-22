@@ -18,7 +18,7 @@
 //! respect to `<group_sid>` — **enabled**, **deny-only**, **absent**:
 //!
 //!   0. **PERMIT non-member** (weight 0xF) — SD
-//!      `O:LSD:(D;;CC;;;<group_sid>)(A;;CC;;;WD)`. The DENY ACE on the
+//!      `O:LSG:LSD:(D;;CC;;;<group_sid>)(A;;CC;;;WD)`. The DENY ACE on the
 //!      group hits any token where the group is present (enabled
 //!      *or* deny-only — `SE_GROUP_USE_FOR_DENY_ONLY` SIDs match DENY
 //!      ACEs); only tokens with the group *absent* fall through to
@@ -26,7 +26,7 @@
 //!      who haven't been added to the group through untouched.
 //!
 //!   1. **PERMIT group-enabled** (weight 0xE) — SD
-//!      `O:LSD:(A;;CC;;;<group_sid>)`. Matches tokens with the group
+//!      `O:LSG:LSD:(A;;CC;;;<group_sid>)`. Matches tokens with the group
 //!      *enabled* (broker, ordinary processes of a member user).
 //!      Tokens with the group deny-only do **not** match: deny-only
 //!      SIDs are ignored by ALLOW ACEs.
@@ -36,7 +36,7 @@
 //!      that fell through filters 0 and 1 (i.e. the deny-only
 //!      sandboxed child) can still reach the host proxy.
 //!
-//!   3. **BLOCK** (weight 0x1) — SD `O:LSD:(A;;CC;;;WD)`
+//!   3. **BLOCK** (weight 0x1) — SD `O:LSG:LSD:(A;;CC;;;WD)`
 //!      (ALLOW-Everyone). Matches every token; catches the sandboxed
 //!      child for everything off-loopback. The Everyone ACE is
 //!      belt-and-braces — a no-condition BLOCK would behave the same
@@ -608,23 +608,33 @@ fn add_filter(
     Ok(())
 }
 
+// SDDL builders for the three ALE_USER_ID security descriptors.
+//
+// All carry `O:LS G:LS` (owner + primary group = LocalService).
+// WFP's kernel-side ALE_USER_ID match doesn't require the primary
+// group to be set, but user-mode `AccessCheck` — which
+// `tests/sd_access_check_matrix.rs` uses to prove these SDs do
+// what we claim — returns ERROR_INVALID_SECURITY_DESCR for an SD
+// with no `G:`. The group's value is irrelevant to DACL
+// evaluation; LS is just a stable, always-present principal.
+
 /// SDDL for filter 0 — DENY `<group_sid>` then ALLOW Everyone.
 /// `AccessCheck` against this SD grants iff the token does **not**
 /// carry the group at all (deny-only counts as carrying it). DENY
 /// before ALLOW is the canonical ACE order.
 pub fn sddl_nonmember(group_sid: &str) -> String {
-    format!("O:LSD:(D;;CC;;;{group_sid})(A;;CC;;;WD)")
+    format!("O:LSG:LSD:(D;;CC;;;{group_sid})(A;;CC;;;WD)")
 }
 
 /// SDDL for filter 1 — ALLOW `<group_sid>`. Grants iff the group is
 /// **enabled** in the token; deny-only SIDs are ignored by ALLOW
 /// ACEs.
 pub fn sddl_group(group_sid: &str) -> String {
-    format!("O:LSD:(A;;CC;;;{group_sid})")
+    format!("O:LSG:LSD:(A;;CC;;;{group_sid})")
 }
 
 /// SDDL for filter 3 — ALLOW Everyone. Grants for every token.
-pub const SDDL_EVERYONE: &str = "O:LSD:(A;;CC;;;WD)";
+pub const SDDL_EVERYONE: &str = "O:LSG:LSD:(A;;CC;;;WD)";
 
 /// Install (or refresh) the eight machine-wide filters under
 /// `sublayer`, keyed only on `group_sid`. Idempotent: any existing
@@ -899,7 +909,7 @@ mod tests {
 
     #[test]
     fn sddl_rejects_garbage() {
-        assert!(OwnedSd::from_sddl("O:LSD:(A;;CC;;;NOT-A-SID)").is_err());
+        assert!(OwnedSd::from_sddl("O:LSG:LSD:(A;;CC;;;NOT-A-SID)").is_err());
     }
 
     #[test]
