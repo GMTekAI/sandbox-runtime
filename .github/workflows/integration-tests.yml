@@ -80,6 +80,11 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
 
+      - name: Smoke-test srt-win exec (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win/ci/smoke-exec.ps1 vendor\srt-win\target\release\srt-win.exe
+
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
         shell: pwsh
