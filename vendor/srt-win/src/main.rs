@@ -3,10 +3,12 @@
 //! Subcommands:
 //!   group  create | status | delete    — manage the discriminator local group
 //!   wfp    install | status | uninstall — manage the persistent WFP filters
+//!   exec   -- <target> [args...]       — spawn under the deny-only-group
+//!                                         token + job + hardening stack
 //!
 //! `status` subcommands write one line of JSON to stdout and exit 0.
 //! Mutating subcommands require elevation and write human-readable
-//! progress to stderr.
+//! progress to stderr. `exec` propagates the child's exit code.
 
 use clap::{Args, Parser, Subcommand};
 
@@ -33,6 +35,46 @@ enum Cmd {
     Wfp {
         #[command(subcommand)]
         sub: WfpCmd,
+    },
+    /// Spawn a process under the deny-only-group sandbox.
+    ///
+    /// Builds a restricted token (group + Admins flipped deny-only,
+    /// LUA, Medium IL, all privs stripped except SeChangeNotify),
+    /// self-protects the broker, assigns the child to a
+    /// kill-on-close job with full UI lockdown, places it on a
+    /// non-interactive desktop, applies process-mitigation
+    /// policies + an explicit handle whitelist, and waits for it
+    /// to exit. Propagates the child's exit code.
+    Exec {
+        #[command(flatten)]
+        group: GroupRef,
+        /// JS-side HTTP proxy port. Sets `HTTP_PROXY` /
+        /// `HTTPS_PROXY` (both cases) on the child.
+        #[arg(long)]
+        http_proxy: Option<u16>,
+        /// JS-side SOCKS proxy port. Sets `ALL_PROXY=socks5h://…`
+        /// (both cases) on the child.
+        #[arg(long)]
+        socks_proxy: Option<u16>,
+        /// Skip the "is the group enabled in the broker's token"
+        /// pre-flight. **Fail-open** — the WFP fence depends on
+        /// that membership; with this set the child may run with
+        /// weaker isolation if the install was incomplete.
+        /// Surfaced as a flag (not an env var) so the bypass is
+        /// intentional and not accidentally inherited. Use ONLY
+        /// in ephemeral CI runners that create the group in-job
+        /// and cannot logout/login mid-run.
+        #[arg(long)]
+        skip_group_check: bool,
+        /// Target executable followed by its arguments. Use `--`
+        /// to terminate srt-win's own option parsing.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            num_args = 1..,
+        )]
+        target: Vec<String>,
     },
 }
 
@@ -124,17 +166,23 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Validate a caller-supplied SID string up front so a typo
-    // surfaces as "invalid --<flag>" rather than an SDDL parse error
-    // three calls deep.
-    let validate_sid = |flag: &str, s: &str| -> anyhow::Result<()> {
-        sid::LocalPsid::from_string(s)
-            .map(|_| ())
-            .with_context(|| format!("invalid --{flag} '{s}'"))
-    };
+    // surfaces as "invalid --<flag>" rather than an SDDL parse
+    // error three calls deep. Returns the CANONICAL `S-1-…` form
+    // (round-tripped through ConvertSidToStringSidW) so SDDL
+    // shorthands like `BA` or lower-case `s-1-…` collapse to a
+    // single comparable representation; downstream
+    // `eq_ignore_ascii_case("S-1-5-32-544")` dedup checks rely on
+    // that.
+    let canonicalize_sid =
+        |flag: &str, s: &str| -> anyhow::Result<String> {
+            let p = sid::LocalPsid::from_string(s)
+                .with_context(|| format!("invalid --{flag} '{s}'"))?;
+            sid::psid_to_string(p.as_psid())
+                .with_context(|| format!("canonicalize --{flag} '{s}'"))
+        };
     let resolve_group_sid = |g: &GroupRef| -> anyhow::Result<String> {
         if let Some(s) = &g.group_sid {
-            validate_sid("group-sid", s)?;
-            return Ok(s.clone());
+            return canonicalize_sid("group-sid", s);
         }
         sid::lookup_account_sid(&g.name)
             .with_context(|| format!("resolve group '{}'", g.name))
@@ -157,10 +205,7 @@ fn run() -> anyhow::Result<()> {
                 ));
             }
             let user = match &user_sid {
-                Some(s) => {
-                    validate_sid("user-sid", s)?;
-                    s.clone()
-                }
+                Some(s) => canonicalize_sid("user-sid", s)?,
                 None => sid::current_user_sid()
                     .context("resolve current user")?,
             };
@@ -277,6 +322,32 @@ fn run() -> anyhow::Result<()> {
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
             eprintln!("srt-win: removed {n} WFP filter(s)");
+        }
+
+        // ─── exec ──────────────────────────────────────────────────
+        Cmd::Exec {
+            group,
+            http_proxy,
+            socks_proxy,
+            skip_group_check,
+            target,
+        } => {
+            use srt_win::launch;
+            let gsid = resolve_group_sid(&group)?;
+            // `target` is `required, num_args=1..` so non-empty.
+            let exe = std::path::PathBuf::from(&target[0]);
+            let args = &target[1..];
+            let spec = launch::ExecSpec {
+                group_sid: &gsid,
+                http_proxy,
+                socks_proxy,
+                skip_group_check,
+                target_exe: &exe,
+                target_args: args,
+            };
+            let code = launch::run(&spec)?;
+            // Propagate the child's exit code verbatim.
+            std::process::exit(code as i32);
         }
     }
     Ok(())
