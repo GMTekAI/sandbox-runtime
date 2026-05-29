@@ -377,20 +377,27 @@ fn do_proc(proc_fd: RawFd, dst: &str, host_proc: bool) {
     );
 
     // Cover writable /proc subdirs that can affect the host even from an
-    // unprivileged process in some configurations (sysrq-trigger). bwrap parity.
+    // unprivileged process in some configurations (sysrq-trigger).
     for sub in &["sys", "sysrq-trigger", "irq", "bus"] {
         let p = format!("{real_dst}/{sub}");
         let cp = cstr(&p);
         if unsafe { libc::access(cp.as_ptr(), libc::W_OK) } < 0 {
-            continue; // already ro or missing — nothing to harden
+            match errno() {
+                libc::EACCES | libc::ENOENT | libc::EROFS => continue,
+                _ => die_errno!("access {p}"),
+            }
         }
-        if mount(Some(&p), &p, None, libc::MS_SILENT | libc::MS_BIND, None).is_err() {
-            die_errno!("cover {p}");
-        }
+        mount_or_die(Some(&p), &p, None, libc::MS_SILENT | libc::MS_BIND, None, &format!("cover {p}"));
         for_each_mount_under(proc_fd, &p, |mp, cur| {
             let new = cur | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RDONLY;
-            if new != cur {
-                let _ = mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None);
+            if new == cur {
+                return;
+            }
+            if let Err(e) = mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None) {
+                if mp != p && e == libc::EACCES {
+                    return;
+                }
+                die_errno!("remount cover {mp}");
             }
         });
     }

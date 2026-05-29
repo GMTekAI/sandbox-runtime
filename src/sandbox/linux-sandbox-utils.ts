@@ -818,17 +818,11 @@ async function generateFilesystemArgs(
   // + re-bind logic applies. Skip /proc and /dev: they're remounted by the
   // caller after this function returns. Skip /sys: kernel interface, tmpfs
   // over it breaks tooling and the host /sys is already read-only via ro-bind.
-  // Skip symlinks: e.g. /bin -> usr/bin is already covered by the /usr entry,
-  // and srt-launcher's mount-point creation mishandles a symlink target.
-  // Skip non-directories: srt-launcher's ensure_file() creat()s the dest even
-  // when it exists, which fails on root-level files that are mode 0444.
   const rootSkip = new Set(['proc', 'dev', 'sys'])
   for (const p of readConfig?.denyOnly || []) {
     if (normalizePathForSandbox(p) === '/') {
-      for (const ent of fs.readdirSync('/', { withFileTypes: true })) {
-        if (rootSkip.has(ent.name)) continue
-        if (!ent.isDirectory()) continue
-        readDenyPaths.push('/' + ent.name)
+      for (const child of fs.readdirSync('/')) {
+        if (!rootSkip.has(child)) readDenyPaths.push('/' + child)
       }
     } else {
       readDenyPaths.push(p)
