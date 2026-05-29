@@ -1,3 +1,4 @@
+import shellquote from 'shell-quote'
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
@@ -386,12 +387,13 @@ export function generateProxyEnvVars(
       // The launcher validates %h/%p (which derive from the git remote URL)
       // before splicing them into the CONNECT request line; the proxy on the
       // other end of the relay applies the allow/deny filter.
-      const quotedLauncher = launcherPath.includes("'")
-        ? // ssh ProxyCommand is single-quoted; escape any embedded quote.
-          launcherPath.replace(/'/g, "'\\''")
-        : launcherPath
+      //
+      // Two shell layers see this: git runs $GIT_SSH_COMMAND via sh, then ssh
+      // runs ProxyCommand via sh. Quote the launcher path for the inner sh
+      // first, then quote the whole ProxyCommand= token for the outer sh.
+      const inner = `${shellquote.quote([launcherPath])} connect %h %p --proxy 127.0.0.1:${httpProxyPort}`
       envVars.push(
-        `GIT_SSH_COMMAND=ssh -o ProxyCommand='${quotedLauncher} connect %h %p --proxy 127.0.0.1:${httpProxyPort}'`,
+        `GIT_SSH_COMMAND=ssh -o ${shellquote.quote([`ProxyCommand=${inner}`])}`,
       )
     }
 
