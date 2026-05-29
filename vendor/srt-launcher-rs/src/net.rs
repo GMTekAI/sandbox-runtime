@@ -50,7 +50,13 @@ fn splice_loop(a_in: RawFd, a_out: RawFd, b_in: RawFd, b_out: RawFd) {
                 continue;
             }
             let (rfd, wfd) = dirs[i];
-            let n = unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = loop {
+                let r = unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) };
+                if r < 0 && errno() == libc::EINTR {
+                    continue;
+                }
+                break r;
+            };
             if n <= 0 {
                 // EOF or error: half-close this direction.
                 unsafe {
@@ -121,6 +127,27 @@ pub struct RelaySpec {
 }
 
 pub fn relay_fork(spec: &RelaySpec) -> libc::pid_t {
+    // Bind and pin the bridge inode in the *stub* before forking, so a missing
+    // socket or busy port aborts the launcher rather than leaving the workload
+    // running with a dead proxy. The fds are inherited by the child.
+    let listener = match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, spec.port)) {
+        Ok(l) => l,
+        Err(e) => die!("relay: bind 127.0.0.1:{}: {e}", spec.port),
+    };
+    // Pin the bridge socket *inode* now, before the workload exists. The
+    // workload may have rw access to the socket's directory via a bind mount
+    // (writes to a bound path land on the same host filesystem); without this
+    // it could swap `unix_path` to a symlink at, say, /var/run/docker.sock and
+    // the relay — which has AF_UNIX capability the workload lacks — would
+    // connect there on its behalf. /proc/self/fd/N resolves directly to the
+    // inode this fd refers to, regardless of what the path now points at.
+    let sock_path_c = std::ffi::CString::new(spec.unix_path.as_str())
+        .unwrap_or_else(|_| die!("relay: unix path contains NUL"));
+    let sock_fd = unsafe { libc::open(sock_path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if sock_fd < 0 {
+        die_errno!("relay: open(O_PATH) {}", spec.unix_path);
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         die_errno!("fork relay");
@@ -129,40 +156,31 @@ pub fn relay_fork(spec: &RelaySpec) -> libc::pid_t {
         unsafe {
             // Own process group so the stub's kill(-pid, SIGKILL) reaches our
             // per-connection children too.
-            libc::setpgid(0, 0);
+            if libc::setpgid(0, 0) < 0 {
+                die_errno!("relay: setpgid");
+            }
             // We're outside the sandbox pidns, so pidns-teardown doesn't reach
             // us. Die with the stub instead.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                die_errno!("relay: prctl(PR_SET_PDEATHSIG)");
+            }
             // The stub couldn't set DUMPABLE=0 before forking us (it needs to
             // write /proc/self/{uid,gid}_map after). Set it ourselves.
-            libc::prctl(libc::PR_SET_DUMPABLE, 0);
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0) < 0 {
+                die_errno!("relay: prctl(PR_SET_DUMPABLE)");
+            }
         }
         // The relay never needs caps; drop them before doing anything else.
         crate::run::drop_all_caps();
-        relay_serve_tcp_to_unix(spec.port, &spec.unix_path);
+        relay_serve_tcp_to_unix(listener, sock_fd);
     }
+    // Stub: close inherited copies so PID 1 / worker don't see them.
+    drop(listener);
+    unsafe { libc::close(sock_fd) };
     pid
 }
 
-fn relay_serve_tcp_to_unix(port: u16, unix_path: &str) -> ! {
-    let listener = match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
-        Ok(l) => l,
-        Err(e) => die!("relay: bind 127.0.0.1:{port}: {e}"),
-    };
-
-    // Pin the bridge socket *inode* now, before the workload exists. The
-    // workload may have rw access to the socket's directory via a bind mount
-    // (writes to a bound path land on the same host filesystem); without this
-    // it could swap `unix_path` to a symlink at, say, /var/run/docker.sock and
-    // the relay — which has AF_UNIX capability the workload lacks — would
-    // connect there on its behalf. /proc/self/fd/N resolves directly to the
-    // inode this fd refers to, regardless of what the path now points at.
-    let sock_path_c = std::ffi::CString::new(unix_path)
-        .unwrap_or_else(|_| die!("relay: unix path contains NUL"));
-    let sock_fd = unsafe { libc::open(sock_path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if sock_fd < 0 {
-        die_errno!("relay: open(O_PATH) {unix_path}");
-    }
+fn relay_serve_tcp_to_unix(listener: TcpListener, sock_fd: RawFd) -> ! {
     let pinned_path = format!("/proc/self/fd/{sock_fd}");
 
     install_nocldwait_sigpipe_ign();
@@ -275,9 +293,13 @@ pub fn relay_main(args: Vec<String>) -> ExitCode {
             continue;
         }
         if pid == 0 {
+            // PDEATHSIG was cleared by fork; re-set so a stuck connection
+            // child doesn't outlive the listener.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
             drop(listener);
             if let Ok(upstream) = TcpStream::connect(SocketAddrV4::new(host, port)) {
                 let _ = upstream.set_nodelay(true);
+                set_tcp_keepalive(upstream.as_raw_fd());
                 let cfd = client.as_raw_fd();
                 let tfd = upstream.as_raw_fd();
                 splice_loop(cfd, tfd, tfd, cfd);
@@ -286,6 +308,19 @@ pub fn relay_main(args: Vec<String>) -> ExitCode {
         }
     }
     unreachable!("UnixListener::incoming() is infinite")
+}
+
+/// SO_KEEPALIVE + TCP_KEEPIDLE/KEEPINTVL/KEEPCNT on a TCP fd. Detects a hung
+/// upstream within ~25s so the per-connection child exits instead of leaking.
+fn set_tcp_keepalive(fd: RawFd) {
+    let one = 1i32;
+    let len = std::mem::size_of::<i32>() as u32;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, (&one as *const i32).cast(), len);
+        for (opt, val) in [(libc::TCP_KEEPIDLE, 10), (libc::TCP_KEEPINTVL, 5), (libc::TCP_KEEPCNT, 3)] {
+            libc::setsockopt(fd, libc::IPPROTO_TCP, opt, (&val as *const i32).cast(), len);
+        }
+    }
 }
 
 /// Parse `HOST:PORT` where HOST is a literal IPv4 address. No DNS — the
