@@ -17,9 +17,8 @@
 //! /proc/self/mountinfo for that, same as bwrap.
 
 use crate::{die, die_errno, errno};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
-use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::ptr;
@@ -209,6 +208,33 @@ fn for_each_mount_under(proc_fd: RawFd, root: &str, mut f: impl FnMut(&str, libc
     }
 }
 
+/// Return the kernel's canonical mount-point string for `path`: realpath, then
+/// open(O_PATH), then readlink(/proc/self/fd/N). mountinfo records exactly the
+/// readlink string (including dcache case on case-insensitive filesystems), so
+/// this is what mountinfo lookups must match against.
+fn kernel_canonical_path(proc_fd: RawFd, path: &str) -> String {
+    let resolved = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) => die!("realpath {path}: {e}"),
+    };
+    let rs = resolved
+        .to_str()
+        .unwrap_or_else(|| die!("non-utf8 path {resolved:?}"));
+    let rc = cstr(rs);
+    let fd = unsafe { libc::open(rc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        die_errno!("open(O_PATH) {rs}");
+    }
+    let link = cstr(&format!("self/fd/{fd}"));
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let n = unsafe { libc::readlinkat(proc_fd, link.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    unsafe { libc::close(fd) };
+    if n < 0 {
+        die_errno!("readlinkat(proc, self/fd/{fd})");
+    }
+    String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+}
+
 // ---------------------------------------------------------------------------
 // ensure_dst: create the bind-mount target as a file or dir matching src.
 // ---------------------------------------------------------------------------
@@ -270,11 +296,14 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, kind: BindKind) {
         &format!("bind {real_src} -> {real_dst}"),
     );
 
+    // mount(2) resolves symlinks in the destination, so the entry in mountinfo
+    // is at the resolved path. Look it up via realpath + /proc/self/fd/N.
+    let canonical_dst = kernel_canonical_path(proc_fd, &real_dst);
+
     // MS_BIND ignores MS_RDONLY/MS_NOSUID/MS_NODEV — they only take effect on
     // MS_REMOUNT. A recursive bind brings submounts along, each needing its
-    // own remount. Mirrors bwrap's bind_mount(): always nosuid; nodev unless
-    // binding device nodes; rdonly when requested. Compute new = current | add
-    // and skip when nothing would change.
+    // own remount. Always nosuid; nodev unless binding device nodes; rdonly
+    // when requested.
     let add = libc::MS_NOSUID
         | match kind {
             BindKind::Rw => libc::MS_NODEV,
@@ -282,35 +311,27 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, kind: BindKind) {
             BindKind::Dev => 0,
         };
 
-    let mut first = true;
-    for_each_mount_under(proc_fd, &real_dst, |mp, cur| {
-        let is_root = first && mp == real_dst;
-        first = false;
+    let mut found_root = false;
+    for_each_mount_under(proc_fd, &canonical_dst, |mp, cur| {
+        let is_root = mp == canonical_dst;
+        found_root |= is_root;
         let new = cur | add;
         if new == cur {
             return;
         }
         if let Err(e) = mount(None, mp, None, libc::MS_SILENT | libc::MS_BIND | libc::MS_REMOUNT | new, None) {
-            // EACCES: a mount we can't read can't be reached by the sandbox
-            // either, so there's nothing to harden. EINVAL/ENOENT: a submount
-            // raced away between mountinfo and remount.
-            //
-            // EPERM on a *submount*: in a userns, mounts inherited from the
-            // parent ns are MNT_LOCKED — the kernel refuses MS_REMOUNT on them
-            // even when we're only adding restrictions. That same lock means
-            // the sandbox can't loosen them either, so skipping is no weaker
-            // than the host. (runc/crun tolerate this for the same reason.)
-            // EPERM on the bind root itself stays fatal: that's the mount we
-            // just created and own; if it won't remount, the bind didn't take.
-            let tolerated = e == libc::EINVAL
-                || e == libc::ENOENT
-                || e == libc::EACCES
-                || (e == libc::EPERM && !is_root);
-            if !tolerated {
+            if is_root {
                 die_errno!("remount {mp}");
+            }
+            // Submount: an unreadable mount is unreachable by the sandbox too.
+            if e != libc::EACCES {
+                die_errno!("remount submount {mp}");
             }
         }
     });
+    if !found_root {
+        die!("bind mount {real_dst}: not found in mountinfo at {canonical_dst}");
+    }
 }
 
 fn do_tmpfs(dst: &str) {
@@ -375,7 +396,7 @@ fn do_proc(proc_fd: RawFd, dst: &str, host_proc: bool) {
     }
 }
 
-fn do_dev(proc_fd: RawFd, dst: &str) {
+fn do_dev(proc_fd: RawFd, dst: &str, host_tty: Option<&str>) {
     let real_dst = prefix_path(NEWROOT, dst);
     ensure_dst(&real_dst, true);
     // No size= option: /dev/shm is a plain directory inside this tmpfs and
@@ -430,18 +451,14 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
         die!("symlink {real_dst}/ptmx: {e}");
     }
 
-    // If stdin is a tty, expose it as /dev/console so programs that talk to
-    // the controlling terminal by name still work.
-    if std::io::stdin().is_terminal() {
-        let mut buf = [0u8; 256];
-        if unsafe { libc::ttyname_r(0, buf.as_mut_ptr().cast(), buf.len()) } == 0 {
-            let tty = CStr::from_bytes_until_nul(&buf)
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let host_tty = format!("{OLDROOT}{tty}");
-            if tty.starts_with("/dev/") && Path::new(&host_tty).exists() {
-                do_bind(proc_fd, &tty, &format!("{dst}/console"), BindKind::Dev);
-            }
+    // If stdout is a tty, expose it as /dev/console so programs that talk to
+    // the controlling terminal by name still work. The tty path is captured
+    // before any unshare/pivot — ttyname_r resolves via /proc/self/fd/N which
+    // is gone here.
+    if let Some(tty) = host_tty {
+        let oldroot_tty = format!("{OLDROOT}{tty}");
+        if tty.starts_with("/dev/") && Path::new(&oldroot_tty).exists() {
+            do_bind(proc_fd, tty, &format!("{dst}/console"), BindKind::Dev);
         }
     }
 }
@@ -450,7 +467,21 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
 // Top-level filesystem setup — the pivot_root dance.
 // ---------------------------------------------------------------------------
 
-pub fn setup_filesystem(ops: &[MountOp]) {
+pub fn setup_filesystem(ops: &mut [MountOp], host_tty: Option<&str>) {
+    // Resolve bind sources on the host root before pivot. After pivot, sources
+    // are reached via /oldroot/<src>, where an absolute symlink target ("/run")
+    // resolves against the staging tmpfs and ENOENTs.
+    for op in ops.iter_mut() {
+        if let MountOp::Bind { src, .. } | MountOp::RoBind { src, .. } = op {
+            if let Ok(r) = fs::canonicalize(&*src) {
+                if let Some(s) = r.to_str() {
+                    *src = s.to_owned();
+                }
+            }
+            // ENOENT etc. fall through; do_bind reports the error in context.
+        }
+    }
+
     // Hold a handle to the host /proc so mountinfo stays readable after the
     // pivot, before the new /proc is mounted.
     let proc_dir = match fs::File::open("/proc") {
@@ -487,12 +518,12 @@ pub fn setup_filesystem(ops: &[MountOp]) {
     // Apply each mount op, rewriting SRC under /oldroot and DST under
     // /newroot. Order matters: the TS layer emits the broad ro-bind / /
     // first, then layers narrower binds on top.
-    for op in ops {
+    for op in ops.iter() {
         match op {
             MountOp::Bind { src, dst } => do_bind(proc_fd, src, dst, BindKind::Rw),
             MountOp::RoBind { src, dst } => do_bind(proc_fd, src, dst, BindKind::Ro),
             MountOp::Tmpfs { dst } => do_tmpfs(dst),
-            MountOp::Dev { dst } => do_dev(proc_fd, dst),
+            MountOp::Dev { dst } => do_dev(proc_fd, dst, host_tty),
             MountOp::Proc { dst, host } => do_proc(proc_fd, dst, *host),
         }
     }

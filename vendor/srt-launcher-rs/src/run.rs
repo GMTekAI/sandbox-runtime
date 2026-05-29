@@ -162,6 +162,21 @@ fn reap_until(main_child: libc::pid_t) -> i32 {
     }
 }
 
+/// ttyname(stdout) before any namespace work. Resolves via /proc/self/fd/1,
+/// which is unavailable after pivot_root.
+fn host_tty_path() -> Option<String> {
+    if unsafe { libc::isatty(1) } != 1 {
+        return None;
+    }
+    let mut buf = [0u8; 256];
+    if unsafe { libc::ttyname_r(1, buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    std::ffi::CStr::from_bytes_until_nul(&buf)
+        .ok()
+        .map(|s| s.to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Namespace entry + uid/gid map (when CLONE_NEWUSER is taken)
 // ---------------------------------------------------------------------------
@@ -336,7 +351,18 @@ fn worker_exec(c: &Config) -> ! {
 // ---------------------------------------------------------------------------
 
 pub fn main(args: Vec<String>) -> ExitCode {
-    let c = parse(args);
+    let mut c = parse(args);
+
+    // Refuse to run setuid or with file capabilities — argv (mount targets,
+    // exec command) is attacker-chosen.
+    if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
+        die!("refusing to run setuid/setgid");
+    }
+
+    // Capture the controlling tty path while /proc is still mounted at /proc.
+    // do_dev binds this as /dev/console; ttyname_r resolves via /proc/self/fd
+    // and would fail after pivot.
+    let host_tty = host_tty_path();
 
     // Set NO_NEW_PRIVS first (bwrap parity), so it's inherited by every
     // subsequent fork — the relays, PID 1, and the worker. unshare(NEWUSER)
@@ -430,7 +456,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
 
     // Filesystem setup happens here so PID 1 (which mounts /proc) is in the
     // pidns whose process list /proc should reflect.
-    mount::setup_filesystem(&c.ops);
+    mount::setup_filesystem(&mut c.ops, host_tty.as_deref());
 
     // Restore cwd best-effort; if the path doesn't exist inside the sandbox,
     // we stay in / (where setup_filesystem left us).
