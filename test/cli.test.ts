@@ -1,5 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 /**
@@ -129,6 +131,44 @@ describe('CLI', () => {
       const result = runCli(['-d'])
       expect(result.stderr).toContain('No command specified')
       expect(result.status).toBe(1)
+    })
+  })
+
+  describe('--settings error handling', () => {
+    // The CLI must fail closed when an explicitly requested settings file
+    // cannot be used: silently falling back to the default config would run
+    // the command without the restrictions the caller asked for (e.g. the
+    // credentials deny rules).
+    test('refuses to run when an explicit --settings file does not exist', () => {
+      const result = runCli([
+        '--settings',
+        '/nonexistent/srt-settings.json',
+        'echo',
+        'should-not-run',
+      ])
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain('Could not load settings')
+      expect(result.stdout).not.toContain('should-not-run')
+    })
+
+    test('refuses to run when an explicit --settings file fails validation', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-cli-settings-'))
+      const settingsPath = join(dir, 'invalid.json')
+      // Valid JSON, but missing required network/filesystem fields
+      writeFileSync(settingsPath, JSON.stringify({ network: {} }))
+      try {
+        const result = runCli([
+          '--settings',
+          settingsPath,
+          'echo',
+          'should-not-run',
+        ])
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('Could not load settings')
+        expect(result.stdout).not.toContain('should-not-run')
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
     })
   })
 

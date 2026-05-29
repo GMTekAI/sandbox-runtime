@@ -87,6 +87,16 @@ async function main(): Promise<void> {
           let runtimeConfig = loadConfig(configPath)
 
           if (!runtimeConfig) {
+            // An explicitly requested settings file must load successfully —
+            // silently falling back to the default config would run the
+            // command without the restrictions the caller asked for.
+            if (options.settings) {
+              console.error(
+                `Error: Could not load settings from ${configPath} (missing, unreadable, or invalid). ` +
+                  'Refusing to run with the default config.',
+              )
+              process.exit(1)
+            }
             logForDebugging(
               `No config found at ${configPath}, using default config`,
             )
