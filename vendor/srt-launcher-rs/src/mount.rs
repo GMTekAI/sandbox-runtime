@@ -378,12 +378,14 @@ fn do_proc(proc_fd: RawFd, dst: &str, host_proc: bool) {
 fn do_dev(proc_fd: RawFd, dst: &str) {
     let real_dst = prefix_path(NEWROOT, dst);
     ensure_dst(&real_dst, true);
+    // No size= option: /dev/shm is a plain directory inside this tmpfs and
+    // POSIX shared memory consumers expect the kernel-default budget (~50% RAM).
     mount_or_die(
         Some("tmpfs"),
         &real_dst,
         Some("tmpfs"),
-        libc::MS_SILENT | libc::MS_NOSUID,
-        Some("mode=755,size=65536k"),
+        libc::MS_SILENT | libc::MS_NOSUID | libc::MS_NODEV,
+        Some("mode=755"),
         &format!("mount tmpfs {real_dst}"),
     );
 
@@ -404,8 +406,12 @@ fn do_dev(proc_fd: RawFd, dst: &str) {
             die!("symlink {link}: {e}");
         }
     }
-    let _ = std::os::unix::fs::symlink("/proc/self/fd", format!("{real_dst}/fd"));
-    let _ = std::os::unix::fs::symlink("/proc/kcore", format!("{real_dst}/core"));
+    if let Err(e) = std::os::unix::fs::symlink("/proc/self/fd", format!("{real_dst}/fd")) {
+        die!("symlink {real_dst}/fd: {e}");
+    }
+    if let Err(e) = std::os::unix::fs::symlink("/proc/kcore", format!("{real_dst}/core")) {
+        die!("symlink {real_dst}/core: {e}");
+    }
 
     // devpts + /dev/ptmx + /dev/shm
     let pts = format!("{real_dst}/pts");
