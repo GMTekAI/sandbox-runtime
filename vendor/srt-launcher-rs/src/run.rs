@@ -111,12 +111,17 @@ fn parse(args: Vec<String>) -> Config {
 // Signal forwarding + PID-1 reaper
 // ---------------------------------------------------------------------------
 
-static FORWARD_TARGET: AtomicI32 = AtomicI32::new(-1);
+static FORWARD_TARGET: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn forward_signal(sig: libc::c_int) {
     let t = FORWARD_TARGET.load(Ordering::Relaxed);
     if t > 0 {
         unsafe { libc::kill(t, sig) };
+    } else {
+        // No target yet (PID 1 during mount setup): exit so the stub's
+        // reap_until reports 128+sig instead of the signal being dropped by
+        // the kernel's pidns-init SIG_DFL semantics.
+        unsafe { libc::_exit(128 + sig) };
     }
 }
 
@@ -364,6 +369,10 @@ pub fn main(args: Vec<String>) -> ExitCode {
     // and would fail after pivot.
     let host_tty = host_tty_path();
 
+    // An inherited SIGCHLD=SIG_IGN makes the kernel auto-reap children, so
+    // waitpid(-1,...) in reap_until never sees the worker's status.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+
     // Set NO_NEW_PRIVS first (bwrap parity), so it's inherited by every
     // subsequent fork — the relays, PID 1, and the worker. unshare(NEWUSER)
     // still grants caps in the new userns regardless; this only blocks
@@ -442,6 +451,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
     // Inherited DUMPABLE=0 from the stub blocks ptrace and /proc/1/mem
     // writes against this process. PDEATHSIG was cleared by fork; re-set it.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+
+    // Handle forwarded signals during mount setup: the kernel drops signals
+    // sent to a pidns init with SIG_DFL disposition. With no worker yet,
+    // forward_signal exits 128+sig. Re-armed with the worker pid below.
+    install_forwarders(0);
 
     // setsid drops the controlling terminal — the TIOCSTI defense. Runs
     // before forking so the worker shares the new session.
