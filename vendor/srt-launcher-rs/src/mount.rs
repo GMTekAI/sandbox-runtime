@@ -323,8 +323,11 @@ fn do_bind(proc_fd: RawFd, src: &str, dst: &str, kind: BindKind) {
             if is_root {
                 die_errno!("remount {mp}");
             }
-            // Submount: an unreadable mount is unreachable by the sandbox too.
-            if e != libc::EACCES {
+            // EACCES: an unreadable submount is unreachable by the sandbox too.
+            // EINVAL/ENOENT: stacked or shadowed mountinfo entries — path-based
+            // remount targets only the top of the stack, and the shadowed
+            // entry is unreachable anyway.
+            if !matches!(e, libc::EACCES | libc::EINVAL | libc::ENOENT) {
                 die_errno!("remount submount {mp}");
             }
         }

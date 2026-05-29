@@ -1273,7 +1273,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // Must be set (issue #161: was empty on Linux)
     expect(gitSshCommand).not.toBe('')
     // Must route through the launcher's HTTP CONNECT helper
-    expect(gitSshCommand).toContain('ssh -o ProxyCommand=')
+    expect(gitSshCommand).toMatch(/^ssh -o '?ProxyCommand=/)
     expect(gitSshCommand).toContain('srt-launcher')
     expect(gitSshCommand).toContain('connect')
   })
