@@ -40,19 +40,7 @@ use crate::winsta::WinStaDesk;
 
 // ─── RAII handle wrappers ───────────────────────────────────────────
 
-/// Owns a kernel `HANDLE`; `CloseHandle` on drop. For tokens and
-/// the like — anything where the only cleanup is `CloseHandle`.
-struct OwnedHandle(HANDLE);
-impl OwnedHandle {
-    fn raw(&self) -> HANDLE { self.0 }
-}
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe { let _ = CloseHandle(self.0); }
-        }
-    }
-}
+use crate::util::OwnedHandle;
 
 /// Owns a freshly-spawned (suspended) child. If dropped before
 /// [`defuse`] is called, terminates the child — so an error
