@@ -107,7 +107,12 @@ describe.if(isLinux)('Sandbox Integration', () => {
       seccompConfig: { argv0: 'x; rm -rf /', applyPath: '/path with space' },
     })
 
-    expect(wrappedCommand).toContain("ARGV0='x; rm -rf /' '/path with space' ")
+    // The prefix is built as ARGV0='x; rm -rf /' '/path with space' and
+    // then re-quoted as part of the single bwrap argument, so its inner
+    // single quotes appear as '\'' in the wrapped command.
+    expect(wrappedCommand).toContain(
+      "ARGV0='\\''x; rm -rf /'\\'' '\\''/path with space'\\'' ",
+    )
   })
 
   it('argv0 mode: rejects argv0 without applyPath', () => {
