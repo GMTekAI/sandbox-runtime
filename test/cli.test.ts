@@ -116,6 +116,16 @@ describe('CLI', () => {
       expect(result.stdout).toBe('$HOME;|&')
       expect(result.status).toBe(0)
     })
+
+    test('preserves a literal ~ in positional args', () => {
+      // A literal ~ in argv means the user quoted it in their own shell
+      // (an unquoted ~ is expanded before srt ever sees it). It must not
+      // be re-expanded to $HOME by the wrap layer's re-parse. shell-quote
+      // left bare ~ unquoted, so this silently became the home directory.
+      const result = runCli(['printf', '%s\n', '~', '~/x', '~root'])
+      expect(result.stdout).toBe('~\n~/x\n~root\n')
+      expect(result.status).toBe(0)
+    })
   })
 
   describe('error handling', () => {

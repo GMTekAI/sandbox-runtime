@@ -445,6 +445,32 @@ export function generateProxyEnvVars(
   return envVars
 }
 
+// Arguments made of only these characters re-parse as a single token
+// without quoting in every sh-family shell (sh, dash, bash, zsh,
+// ksh), in any version and under any option state. Deliberately
+// narrower than Python's shlex.quote (which also leaves % + = : @ ,
+// bare): zsh expands unquoted '=' words (EQUALS) and — with
+// magic_equal_subst, settable from ~/.zshenv, which `zsh -c`
+// sources — expands '~' after mid-word '=' or ':' in
+// identifier=value arguments. Quoting those characters always is
+// free; auditing every shell's treatment of them is not.
+const SHELL_SAFE_ARG = /^[A-Za-z0-9_\-./]+$/
+
+/**
+ * Quote argv elements so that `sh -c <result>` re-parses them into the
+ * original tokens. Unsafe elements are wrapped in single quotes, with
+ * embedded single quotes rewritten as `'\''` (close quote, escaped
+ * quote, reopen quote) — inside single quotes a POSIX shell treats
+ * every other byte, including newlines, as literal.
+ */
+export function quoteForShell(args: readonly string[]): string {
+  return args
+    .map(arg =>
+      SHELL_SAFE_ARG.test(arg) ? arg : `'${arg.replace(/'/g, "'\\''")}'`,
+    )
+    .join(' ')
+}
+
 /**
  * Encode a command for sandbox monitoring
  * Truncates to 100 chars and base64 encodes to avoid parsing issues

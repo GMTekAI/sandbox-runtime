@@ -994,11 +994,13 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
       writeConfig: undefined,
     })
 
+    // quoteForShell wraps the profile in single quotes, so the profile's
+    // double quotes appear literally in the wrapped command.
     expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name \\"com.apple.CoreSimulator.CoreSimulatorService\\"))',
+      '(allow mach-lookup (global-name "com.apple.CoreSimulator.CoreSimulatorService"))',
     )
     expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name-prefix \\"2BUA8C4S2C.com.1password.\\"))',
+      '(allow mach-lookup (global-name-prefix "2BUA8C4S2C.com.1password."))',
     )
   })
 

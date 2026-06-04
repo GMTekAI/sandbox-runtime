@@ -25,8 +25,8 @@ describe.if(isMacOS)('tls-terminate trust env injection (macOS)', () => {
   it('wrapped command contains all trust env vars', () => {
     const wrapped = wrap('env', CA_CERT)
     for (const v of CA_TRUST_VARS) {
-      // shellquote escapes '=' so the env arg is VAR\=value
-      expect(wrapped).toContain(`${v}\\=${CA_CERT}`)
+      // quoteForShell treats '=' as safe, so the env arg is VAR=value
+      expect(wrapped).toContain(`${v}=${CA_CERT}`)
     }
   })
 
