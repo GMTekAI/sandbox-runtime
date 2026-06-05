@@ -19,7 +19,7 @@ import {
   wrapCommandWithSandboxMacOS,
   writeMacOSProfileFile,
 } from '../../src/sandbox/macos-sandbox-utils.js'
-import { isMacOS } from '../helpers/platform.js'
+import { isMacOS, isWindows } from '../helpers/platform.js'
 import type { FsWriteRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
 
 /**
@@ -48,7 +48,10 @@ function extractProfileFilePath(wrappedCommand: string): string | undefined {
   return fIndex === -1 ? undefined : (args[fIndex + 1] as string)
 }
 
-describe('macOS sandbox profile file (-f)', () => {
+// Profile generation works on any POSIX platform (CI runs these on Linux
+// too), but not Windows: no `bash` in PATH for whichSync, and POSIX file
+// modes/uids don't apply. The live sandbox-exec tests are macOS-only.
+describe.if(!isWindows)('macOS sandbox profile file (-f)', () => {
   let savedTmpdir: string | undefined
   let testTmp: string
 
