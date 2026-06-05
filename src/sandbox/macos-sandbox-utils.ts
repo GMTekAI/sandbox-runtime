@@ -761,7 +761,7 @@ function escapePath(pathStr: string): string {
 // Generous so that a wrap → spawn gap (scheduling, machine sleep) can't delete
 // a profile before sandbox-exec reads it.
 const PROFILE_FILE_MAX_AGE_MS = 5 * 60 * 1000
-const PROFILE_FILE_RE = /^sbx-\d+-(\d+)-[0-9a-f]+\.sb$/
+const PROFILE_FILE_RE = /^srt-\d+-(\d+)-[0-9a-f]+\.sb$/
 
 /**
  * Directory holding seatbelt profile files passed to sandbox-exec -f.
@@ -783,7 +783,7 @@ export function getMacOSProfileFileDir(): string {
     // Keep the unresolved path; normalizePathForSandbox handles the rest.
   }
   const uid = typeof process.getuid === 'function' ? process.getuid() : 0
-  return path.join(tmp, `sbx-profiles-${uid}`)
+  return path.join(tmp, `srt-profiles-${uid}`)
 }
 
 /**
@@ -821,7 +821,7 @@ export function writeMacOSProfileFile(profile: string): string {
   }
   const profileFile = path.join(
     profileDir,
-    `sbx-${process.pid}-${now}-${randomBytes(8).toString('hex')}.sb`,
+    `srt-${process.pid}-${now}-${randomBytes(8).toString('hex')}.sb`,
   )
   fs.writeFileSync(profileFile, profile, { mode: 0o600 })
   return profileFile

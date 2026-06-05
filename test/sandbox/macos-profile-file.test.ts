@@ -151,8 +151,8 @@ describe.if(!isWindows)('macOS sandbox profile file (-f)', () => {
     const profileDir = getMacOSProfileFileDir()
     mkdirSync(profileDir, { recursive: true, mode: 0o700 })
 
-    const staleName = `sbx-123-${Date.now() - 10 * 60 * 1000}-abcdef0123456789.sb`
-    const freshName = `sbx-123-${Date.now() - 60 * 1000}-abcdef0123456789.sb`
+    const staleName = `srt-123-${Date.now() - 10 * 60 * 1000}-abcdef0123456789.sb`
+    const freshName = `srt-123-${Date.now() - 60 * 1000}-abcdef0123456789.sb`
     const foreignName = 'unrelated.txt'
     writeFileSync(join(profileDir, staleName), 'stale')
     writeFileSync(join(profileDir, freshName), 'fresh')
@@ -211,7 +211,7 @@ describe.if(!isWindows)('macOS sandbox profile file (-f)', () => {
       // profile-dir deny rule stands between the sandboxed command and the
       // next command's policy file.
       const wrappedCommand = wrapCommandWithSandboxMacOS({
-        command: `echo "(version 1)(allow default)" > ${profileDir}/sbx-evil.sb`,
+        command: `echo "(version 1)(allow default)" > ${profileDir}/srt-evil.sb`,
         needsNetworkRestriction: false,
         readConfig: undefined,
         writeConfig: { allowOnly: [testTmp], denyWithinAllow: [] },
@@ -223,7 +223,7 @@ describe.if(!isWindows)('macOS sandbox profile file (-f)', () => {
         timeout: 10000,
       })
       expect(result.status).not.toBe(0)
-      expect(existsSync(join(profileDir, 'sbx-evil.sb'))).toBe(false)
+      expect(existsSync(join(profileDir, 'srt-evil.sb'))).toBe(false)
     })
 
     it('blocks overwriting an existing profile file', () => {
