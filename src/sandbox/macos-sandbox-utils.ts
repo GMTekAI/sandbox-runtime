@@ -269,6 +269,7 @@ function generateReadRules(
   }
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
+  const allowedSubpaths: string[] = []
   for (const pathPattern of config.allowWithinDeny || []) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
@@ -280,9 +281,26 @@ function generateReadRules(
         `  (with message "${logTag}"))`,
       )
     } else {
+      allowedSubpaths.push(normalizedPath)
       rules.push(
         `(allow file-read*`,
         `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+  }
+  // A literal denyOnly path nested inside a literal allowWithinDeny subpath
+  // would otherwise be re-allowed (last-match-wins). Re-emit it so the
+  // more-specific deny lands last. Glob denies aren't re-emitted: nesting
+  // of regex-vs-subpath isn't decidable here, and the schema's denyReadAlways
+  // is the explicit lever for that case.
+  for (const denyPath of config.denyOnly || []) {
+    if (containsGlobChars(denyPath)) continue
+    const normalized = normalizePathForSandbox(denyPath)
+    if (allowedSubpaths.some(a => normalized.startsWith(a + '/'))) {
+      rules.push(
+        `(deny file-read*`,
+        `  (subpath ${escapePath(normalized)})`,
         `  (with message "${logTag}"))`,
       )
     }

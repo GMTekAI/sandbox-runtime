@@ -452,6 +452,33 @@ describe('allowRead without denyRead does not trigger sandboxing', () => {
   )
 })
 
+// A literal denyRead path nested under a literal allowRead subpath must keep
+// its deny: Seatbelt is last-match-wins, so the deny is re-emitted after the
+// allow. (Glob paths are out of scope; denyReadAlways is the lever there.)
+describe.if(isMacOS)('macOS denyRead nested under allowRead', () => {
+  it('re-emits the deny after the allow so it stays denied', () => {
+    const result = wrapCommandWithSandboxMacOS({
+      command: 'cat /work/secrets/key',
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: ['/work/secrets'],
+        allowWithinDeny: ['/work'],
+      },
+      writeConfig: undefined,
+    })
+    // The profile is embedded in a shell command, so quotes are escaped —
+    // match on the unquoted skeleton.
+    const allowAt = result.indexOf('(allow file-read*\n  (subpath')
+    const lastDenySecrets = result.lastIndexOf('/work/secrets')
+    const firstDenySecrets = result.indexOf('/work/secrets')
+    expect(allowAt).toBeGreaterThan(-1)
+    // The deny on /work/secrets appears both before and after the allow:
+    // original emit, then re-emit after allowWithinDeny.
+    expect(firstDenySecrets).toBeLessThan(allowAt)
+    expect(lastDenySecrets).toBeGreaterThan(allowAt)
+  })
+})
+
 describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
   const TEST_BASE_DIR = join(tmpdir(), 'rm-under-denyread-' + Date.now())
   const TEST_PROJECT_DIR = join(TEST_BASE_DIR, 'project')
