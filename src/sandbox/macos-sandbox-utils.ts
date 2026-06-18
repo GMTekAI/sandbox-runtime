@@ -645,18 +645,30 @@ function generateSandboxProfile({
   if (!needsNetworkRestriction) {
     profile.push('(allow network*)')
   } else {
-    // Allow local binding if requested
-    // Use "*:*" instead of "localhost:*" because modern runtimes (Java, etc.) create
-    // IPv6 dual-stack sockets by default. When binding such a socket to 127.0.0.1,
-    // the kernel represents it as ::ffff:127.0.0.1 (IPv4-mapped IPv6). Seatbelt's
-    // "localhost" filter only matches 127.0.0.1 and ::1, NOT ::ffff:127.0.0.1.
-    // Using (local ip "*:*") is safe because it only matches the LOCAL endpoint —
-    // internet-bound connections originate from non-loopback interfaces, so they
-    // remain blocked by (deny default).
+    // Allow local binding if requested.
+    //
+    // bind/inbound use (local ip "*:*") instead of "localhost:*" because modern
+    // runtimes (Java, etc.) create IPv6 dual-stack sockets by default; binding
+    // such a socket to 127.0.0.1 is represented in the kernel as
+    // ::ffff:127.0.0.1, which Seatbelt's "localhost" filter does not match.
+    // Seatbelt only accepts "localhost" or "*" as the host token, so "*:*" is
+    // the only way to admit the IPv4-mapped form. bind/inbound are local
+    // operations (no remote endpoint), so wildcarding them does not grant
+    // egress.
+    //
+    // outbound uses (remote ip "localhost:*") so the egress allowlist remains
+    // enforced when allowLocalBinding is set (#225, #88). A (local ip ...)
+    // filter on network-outbound is evaluated against the source address,
+    // which for an unbound socket is INADDR_ANY (0.0.0.0 / ::) at connect()
+    // time — Seatbelt's "localhost" matches the any-address, so any
+    // (local ip ...) host value admits every outbound connection. (remote ip
+    // "localhost:*") matches connect() to 127.0.0.1 and ::1 but not
+    // ::ffff:127.0.0.1; runtimes that connect to loopback via dual-stack
+    // sockets need to use AF_INET (see JAVA_TOOL_OPTIONS injection below).
     if (allowLocalBinding) {
       profile.push('(allow network-bind (local ip "*:*"))')
       profile.push('(allow network-inbound (local ip "*:*"))')
-      profile.push('(allow network-outbound (local ip "*:*"))')
+      profile.push('(allow network-outbound (remote ip "localhost:*"))')
     }
     // Unix domain sockets for local IPC (SSH agent, Docker, Gradle, etc.)
     // Three separate operations must be allowed:
@@ -826,6 +838,25 @@ export function wrapCommandWithSandboxMacOS(
     caCertPath,
     proxyAuthToken,
   )
+
+  // Seatbelt's (remote ip "localhost:*") filter — used for the
+  // allowLocalBinding outbound rule above — matches 127.0.0.1 and ::1 but not
+  // the IPv4-mapped IPv6 form ::ffff:127.0.0.1. Modern Java defaults to
+  // AF_INET6 dual-stack sockets, so a Java client connecting to 127.0.0.1
+  // reaches the kernel as ::ffff:127.0.0.1 and is denied. Forcing the IPv4
+  // stack makes Java open AF_INET sockets so loopback connect matches the
+  // Seatbelt filter. The flag is appended after any inherited
+  // JAVA_TOOL_OPTIONS unless that var is on the credential-deny list, in
+  // which case the inherited value is dropped so the deny holds.
+  if (allowLocalBinding && needsNetworkRestriction) {
+    const flag = '-Djava.net.preferIPv4Stack=true'
+    const denied = (unsetEnvVars ?? []).includes('JAVA_TOOL_OPTIONS')
+    const inherited = denied ? '' : (process.env.JAVA_TOOL_OPTIONS ?? '')
+    const value = inherited.includes(flag)
+      ? inherited
+      : [inherited, flag].filter(Boolean).join(' ')
+    proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${value}`)
+  }
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
   // Resolve the full path to the shell binary
