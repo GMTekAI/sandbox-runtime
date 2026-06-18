@@ -1,6 +1,7 @@
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
+import { SentinelRegistry } from './credential-sentinel.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -81,6 +82,9 @@ let mitmCA: MitmCA | undefined
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
 const sandboxViolationStore = new SandboxViolationStore()
+// Per-session sentinel↔real-value map for masked credentials. Lives only in
+// process memory; never written to disk or logged. Cleared on reset().
+const sentinelRegistry = new SentinelRegistry()
 
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -1260,6 +1264,7 @@ async function reset(): Promise<void> {
   initializationPromise = undefined
   parentProxy = undefined
   mitmCA = undefined
+  sentinelRegistry.clear()
 }
 
 function getSandboxViolationStore() {
@@ -1375,6 +1380,7 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
+  getSentinelRegistry(): SentinelRegistry
   updateConfig(newConfig: SandboxRuntimeConfig): void
   cleanupAfterCommand(): void
   reset(): Promise<void>
@@ -1412,6 +1418,7 @@ export const SandboxManager: ISandboxManager = {
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,
+  getSentinelRegistry: () => sentinelRegistry,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
