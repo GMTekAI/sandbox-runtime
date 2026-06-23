@@ -396,18 +396,127 @@ describe('Config Validation', () => {
       expect(result.success).toBe(true)
     })
 
-    test('rejects mode "mask" for files with an actionable message', () => {
+    test('accepts mode "mask" for files when tlsTerminate is enabled', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
         credentials: {
-          files: [{ path: '~/.config/gh/hosts.yml', mode: 'mask' }],
+          files: [{ path: '~/.config/gh/token', mode: 'mask' }],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects mode "mask" for files without tlsTerminate', () => {
+      // Same TLS-or-allowPlaintextInject gate as for env vars — the
+      // substitution path is identical.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          files: [{ path: '~/.config/gh/token', mode: 'mask' }],
         },
       })
       expect(result.success).toBe(false)
       if (!result.success) {
         const messages = result.error.issues.map(i => i.message).join('\n')
-        expect(messages).toContain('not supported for files yet')
-        expect(messages).toContain('"mask"')
+        expect(messages).toContain('tlsTerminate')
+      }
+    })
+
+    test('accepts a masked file with per-entry injectHosts', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/token',
+              mode: 'mask',
+              injectHosts: ['api.github.com'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects a masked file whose per-entry injectHosts is explicitly empty', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            { path: '~/.config/gh/token', mode: 'mask', injectHosts: [] },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message).join('\n')
+        expect(messages).toContain('masked but never injected')
+      }
+    })
+
+    test('rejects per-entry file injectHosts not reachable via allowedDomains', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.npmrc-token',
+              mode: 'mask',
+              injectHosts: ['registry.npmjs.org'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(i =>
+          i.path.join('.').startsWith('credentials.files.0.injectHosts'),
+        )
+        expect(issue?.message).toContain('registry.npmjs.org')
+        expect(issue?.message).toContain('network.allowedDomains')
+      }
+    })
+
+    test('rejects mode "mask" on a directory path (trailing slash)', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [{ path: '~/.aws/', mode: 'mask' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.path',
+        )
+        expect(issue?.message).toContain('single file')
+        expect(issue?.message).toContain('directory')
       }
     })
 

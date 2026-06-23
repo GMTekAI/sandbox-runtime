@@ -119,25 +119,10 @@ const ParentProxyConfigSchema = z.object({
  *   environment variable.
  * - `mask` — the sandboxed process sees a per-session sentinel value; the
  *   host proxy substitutes sentinel→real on egress to `injectHosts`.
- *   Currently supported for env vars only; rejected for files until file
- *   masking ships.
+ *   For files this is whole-file masking (Linux only; degrades to `deny`
+ *   on macOS — see {@link CredentialFileConfigSchema}).
  */
 const credentialModeSchema = z.enum(['deny', 'mask'])
-
-/**
- * Mode schema for credential files. `mask` is reserved but rejected until
- * file masking ships, so a config can never request behaviour that isn't
- * wired yet.
- */
-const credentialFileModeSchema = credentialModeSchema.refine(
-  mode => mode !== 'mask',
-  {
-    message:
-      'Credential mode "mask" is not supported for files yet. Use "deny" ' +
-      'to block the file inside the sandbox; file masking will be added in ' +
-      'a future release. (Env var masking is supported.)',
-  },
-)
 
 /**
  * Schema for an environment variable name. Restricted to POSIX identifiers so
@@ -153,13 +138,34 @@ const envVarNameSchema = z
 
 /**
  * Schema for a single credential file/directory entry.
+ *
+ * `mode: "mask"` is **whole-file** masking: the entire file content is
+ * replaced inside the sandbox with one sentinel string, and the proxy
+ * substitutes that sentinel back to the real bytes on egress. This works
+ * for files whose content *is* the credential (a token file, a single-line
+ * secret). It does **not** work for structured files a tool parses
+ * (`.netrc`, JSON/YAML configs) — the tool will fail to parse the sentinel.
+ * For those, prefer env-var masking where the tool supports it, or
+ * `mode: "deny"`. Format-aware extraction is a possible future extension.
+ *
+ * On macOS, SBPL cannot redirect reads, so `mode: "mask"` currently
+ * degrades to `mode: "deny"` (the file is unreadable inside the sandbox).
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
     'Path to a credential file or directory. Supports the same path forms as ' +
       'filesystem.denyRead (absolute paths and ~ expansion).',
   ),
-  mode: credentialFileModeSchema.describe('Access mode for this path'),
+  mode: credentialModeSchema.describe('Access mode for this path'),
+  injectHosts: z
+    .array(domainPatternSchema)
+    .optional()
+    .describe(
+      'Optional narrowing of where the proxy substitutes this credential. ' +
+        'If unset, defaults to network.allowedDomains — the credential is ' +
+        'injected at every reachable host. Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
+    ),
 })
 
 /**
@@ -562,23 +568,21 @@ export const SandboxRuntimeConfigSchema = z
     // with no injectHosts defaults to network.allowedDomains (every
     // reachable host), so absence is fine. An *explicit* empty list is
     // rejected — "mask but never inject" is self-contradictory and almost
-    // certainly a config mistake.
-    let hasMaskedEnv = false
-    for (const [idx, v] of (creds.envVars ?? []).entries()) {
-      if (v.injectHosts) {
-        checkSubset(v.injectHosts, [
-          'credentials',
-          'envVars',
-          idx,
-          'injectHosts',
-        ])
+    // certainly a config mistake. Applies to both env vars and files.
+    let hasMasked = false
+    const checkMaskedEntry = (
+      entry: { mode: string; injectHosts?: string[] },
+      path: (string | number)[],
+    ) => {
+      if (entry.injectHosts) {
+        checkSubset(entry.injectHosts, [...path, 'injectHosts'])
       }
-      if (v.mode !== 'mask') continue
-      hasMaskedEnv = true
-      if (v.injectHosts !== undefined && v.injectHosts.length === 0) {
+      if (entry.mode !== 'mask') return
+      hasMasked = true
+      if (entry.injectHosts !== undefined && entry.injectHosts.length === 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['credentials', 'envVars', idx],
+          path,
           message:
             `injectHosts is explicitly empty — the credential would be ` +
             `masked but never injected. Omit injectHosts to default to ` +
@@ -586,12 +590,32 @@ export const SandboxRuntimeConfigSchema = z
         })
       }
     }
+    for (const [idx, v] of (creds.envVars ?? []).entries()) {
+      checkMaskedEntry(v, ['credentials', 'envVars', idx])
+    }
+    for (const [idx, f] of (creds.files ?? []).entries()) {
+      checkMaskedEntry(f, ['credentials', 'files', idx])
+      // Whole-file masking replaces one file's bytes with one sentinel;
+      // a directory has no single content to mask. The hard check is at
+      // runtime (stat after path normalization) — this catches the obvious
+      // syntactic case (trailing slash) early with a clearer error.
+      if (f.mode === 'mask' && f.path.endsWith('/')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'files', idx, 'path'],
+          message:
+            `Credential mode "mask" applies to a single file, not a ` +
+            `directory. Use mode "deny" for "${f.path}", or point at the ` +
+            `credential file inside it.`,
+        })
+      }
+    }
 
-    // Masked env vars require the TLS-terminated proxy path so the real
-    // credential is only sent to a cert-verified upstream. allowPlaintextInject
+    // Masked credentials require the TLS-terminated proxy path so the real
+    // value is only sent to a cert-verified upstream. allowPlaintextInject
     // is the explicit escape hatch.
     if (
-      hasMaskedEnv &&
+      hasMasked &&
       cfg.network.tlsTerminate === undefined &&
       !creds.allowPlaintextInject
     ) {
