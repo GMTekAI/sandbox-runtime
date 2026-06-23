@@ -228,3 +228,33 @@ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
   )
   return null
 }
+
+/**
+ * Locate srt-seccomp-supervisor using the same search rules as
+ * apply-seccomp (explicit override → bundled vendor/seccomp/{arch} →
+ * global npm install). Returns null if unavailable; callers degrade to
+ * no-monitoring.
+ */
+export function getSeccompSupervisorBinaryPath(
+  explicitPath?: string,
+): string | null {
+  if (explicitPath) {
+    return fs.existsSync(explicitPath) ? explicitPath : null
+  }
+  const arch = getVendorArchitecture()
+  if (!arch) return null
+  for (const p of getLocalSeccompPaths('srt-seccomp-supervisor')) {
+    if (fs.existsSync(p)) return p
+  }
+  for (const globalBase of getGlobalNpmPaths()) {
+    const p = join(
+      globalBase,
+      'vendor',
+      'seccomp',
+      arch,
+      'srt-seccomp-supervisor',
+    )
+    if (fs.existsSync(p)) return p
+  }
+  return null
+}

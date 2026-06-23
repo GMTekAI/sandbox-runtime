@@ -72,7 +72,7 @@ jobs:
         with:
           name: seccomp-arm64
           path: vendor/seccomp/arm64
-      - run: chmod +x vendor/seccomp/*/apply-seccomp
+      - run: chmod +x vendor/seccomp/*/apply-seccomp vendor/seccomp/*/srt-seccomp-supervisor
 
       - run: npm install
       - run: npm run clean && npm run build

@@ -30,6 +30,7 @@
  */
 
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -42,8 +43,13 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/syscall.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
+#include <linux/audit.h>
+#include <linux/bpf_common.h>
 
 #include "unix-block-bpf.h"
 
@@ -59,6 +65,188 @@
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
 #endif
+
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
+#endif
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF 0x7fc00000U
+#endif
+
+#if defined(__x86_64__)
+#  define SRT_AUDIT_ARCH AUDIT_ARCH_X86_64
+#  define SRT_HAS_X32 1
+#elif defined(__aarch64__)
+#  define SRT_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#  define SRT_HAS_X32 0
+#else
+#  define SRT_AUDIT_ARCH 0
+#  define SRT_HAS_X32 0
+#endif
+
+/* ---- Optional passive observation filter -------------------------------
+ * When SRT_OBSERVE_SOCK is set, install a second seccomp filter that traps
+ * write-intent filesystem syscalls (and connect) to SECCOMP_RET_USER_NOTIF
+ * and hand the listener fd to the supervisor over that unix socket. The
+ * supervisor replies CONTINUE to every notification, so this never changes
+ * the workload's behaviour — it only lets the parent record which paths a
+ * sandboxed command tried to touch. Every failure path is non-fatal: log a
+ * one-line JSON error on the socket if we managed to connect, then proceed
+ * exactly as if SRT_OBSERVE_SOCK were unset. */
+
+#define OBS_WRITE_MASK ((unsigned)(O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND))
+
+static void observe_fail(int sock, const char *why) {
+    if (sock >= 0) {
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf),
+                         "{\"observe_init_error\":\"%s: %s\"}\n",
+                         why, strerror(errno));
+        if (n > 0) (void)!write(sock, buf, (size_t)n);
+        close(sock);
+    }
+}
+
+static int build_observe_bpf(struct sock_filter *f, int cap) {
+    /* Syscalls that always trap. openat/open are handled separately so their
+     * flags argument can gate the trap; openat2 traps unconditionally because
+     * its flags live behind a userspace pointer the BPF program cannot read.
+     * x86_64 still has the legacy non-*at entry points and glibc/coreutils
+     * call them directly; aarch64 only ever had the *at forms. */
+    static const int trap_nrs[] = {
+#ifdef __NR_openat2
+        __NR_openat2,
+#endif
+        __NR_unlinkat, __NR_mkdirat, __NR_symlinkat, __NR_linkat,
+#ifdef __NR_renameat
+        __NR_renameat,
+#endif
+        __NR_renameat2, __NR_connect,
+#ifdef __x86_64__
+        __NR_creat, __NR_unlink, __NR_mkdir, __NR_rmdir, __NR_rename,
+        __NR_link, __NR_symlink, __NR_truncate, __NR_chmod,
+        __NR_chown, __NR_lchown,
+#endif
+    };
+    const int ntrap = (int)(sizeof(trap_nrs) / sizeof(trap_nrs[0]));
+
+    int n = 0;
+    int allow_at, notify_at;
+#define EMIT(ins) do { if (n >= cap) return -1; f[n++] = (struct sock_filter)ins; } while (0)
+
+    /* arch check */
+    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                  offsetof(struct seccomp_data, arch)));
+    int j_arch = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SRT_AUDIT_ARCH, 0, 0)); /* jf→ALLOW */
+
+    /* nr */
+    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                  offsetof(struct seccomp_data, nr)));
+#if SRT_HAS_X32
+    int j_x32 = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000u, 0, 0));    /* jt→ALLOW */
+#endif
+
+    int j_trap[24];
+    for (int i = 0; i < ntrap; i++) {
+        j_trap[i] = n;
+        EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)trap_nrs[i], 0, 0)); /* jt→NOTIFY */
+    }
+
+    /* openat: trap only when flags (args[2]) carry write intent */
+    int j_openat = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)__NR_openat, 0, 0)); /* jf→next */
+    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                  offsetof(struct seccomp_data, args[2])));
+    EMIT(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, OBS_WRITE_MASK));
+    int j_oat_flags = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0));              /* jt→ALLOW jf→NOTIFY */
+
+#ifdef __x86_64__
+    /* open: trap only when flags (args[1]) carry write intent */
+    int j_open = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)__NR_open, 0, 0)); /* jf→ALLOW */
+    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                  offsetof(struct seccomp_data, args[1])));
+    EMIT(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, OBS_WRITE_MASK));
+    int j_o_flags = n;
+    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0));              /* jt→ALLOW jf→NOTIFY */
+#endif
+
+    allow_at = n;
+    EMIT(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    notify_at = n;
+    EMIT(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF));
+
+#define TO(idx, tgt) ((unsigned char)((tgt) - (idx) - 1))
+    f[j_arch].jf  = TO(j_arch, allow_at);
+#if SRT_HAS_X32
+    f[j_x32].jt   = TO(j_x32, allow_at);
+#endif
+    for (int i = 0; i < ntrap; i++) f[j_trap[i]].jt = TO(j_trap[i], notify_at);
+#ifdef __x86_64__
+    f[j_openat].jf    = TO(j_openat, j_open);
+    f[j_oat_flags].jt = TO(j_oat_flags, allow_at);
+    f[j_oat_flags].jf = TO(j_oat_flags, notify_at);
+    f[j_open].jf      = TO(j_open, allow_at);
+    f[j_o_flags].jt   = TO(j_o_flags, allow_at);
+    f[j_o_flags].jf   = TO(j_o_flags, notify_at);
+#else
+    f[j_openat].jf    = TO(j_openat, allow_at);
+    f[j_oat_flags].jt = TO(j_oat_flags, allow_at);
+    f[j_oat_flags].jf = TO(j_oat_flags, notify_at);
+#endif
+#undef TO
+#undef EMIT
+    return n;
+}
+
+static void install_observe_filter(void) {
+    const char *path = getenv("SRT_OBSERVE_SOCK");
+    if (!path || !*path || SRT_AUDIT_ARCH == 0) return;
+    unsetenv("SRT_OBSERVE_SOCK");   /* don't leak into the workload */
+
+    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (sock < 0) { observe_fail(-1, "socket"); return; }
+
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof(sa.sun_path)) { observe_fail(sock, "path"); return; }
+    strcpy(sa.sun_path, path);
+    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        observe_fail(sock, "connect"); return;
+    }
+
+    const char *enc = getenv("SRT_ENCODED_CMD");
+    if (enc && *enc) {
+        char hdr[768];
+        int n = snprintf(hdr, sizeof(hdr), "{\"encodedCommand\":\"%.700s\"}\n", enc);
+        if (n > 0) (void)!write(sock, hdr, (size_t)n);
+    }
+
+    struct sock_filter filt[48];
+    int len = build_observe_bpf(filt, 48);
+    if (len < 0) { observe_fail(sock, "bpf"); return; }
+    struct sock_fprog prog = { .len = (unsigned short)len, .filter = filt };
+
+    int nfd = (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                           SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+    if (nfd < 0) { observe_fail(sock, "seccomp"); return; }
+
+    char dummy = 'F';
+    union { struct cmsghdr align; char ctl[CMSG_SPACE(sizeof(int))]; } u;
+    memset(&u, 0, sizeof(u));
+    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                          .msg_control = u.ctl, .msg_controllen = sizeof(u.ctl) };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &nfd, sizeof(int));
+    if (sendmsg(sock, &msg, 0) < 0) observe_fail(sock, "sendmsg");
+    else close(sock);
+    close(nfd);   /* supervisor now holds the only reference */
+}
 
 static void die(const char *msg) {
     perror(msg);
@@ -270,6 +458,11 @@ int main(int argc, char *argv[]) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
+    /* Best-effort: hand a USER_NOTIF listener to the supervisor so it can
+     * record write-intent paths. Runs before the unix-block filter so the
+     * AF_UNIX connect() is still permitted, and before exec so only the
+     * workload is observed. Never fatal. */
+    install_observe_filter();
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
         die("apply-seccomp: prctl(PR_SET_SECCOMP)");
     }

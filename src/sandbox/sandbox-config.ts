@@ -410,6 +410,12 @@ export const WindowsConfigSchema = z.object({
  */
 export const SeccompConfigSchema = z.object({
   applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+  supervisorPath: z
+    .string()
+    .optional()
+    .describe(
+      'Path to the srt-seccomp-supervisor binary (USER_NOTIF violation observer).',
+    ),
   argv0: z
     .string()
     .optional()
