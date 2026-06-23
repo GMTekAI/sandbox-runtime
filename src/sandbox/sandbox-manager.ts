@@ -45,6 +45,7 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  decodeSandboxedCommand,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -110,11 +111,29 @@ function registerCleanup(): void {
 async function filterNetworkRequest(
   port: number,
   host: string,
-  sandboxAskCallback?: SandboxAskCallback,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  encodedCommand: string | undefined,
 ): Promise<boolean> {
+  // Record every deny as a sandbox violation so the model sees a structured
+  // <sandbox_violations> block alongside the raw 403/SOCKS-deny in stderr —
+  // parity with the macOS seatbelt log monitor and the Linux seccomp
+  // observer. The proxy is the only component that knows the destination
+  // host, so neither of those can produce this line.
+  const denied = (reason: string): false => {
+    sandboxViolationStore.addViolation({
+      line: `deny network-outbound ${host}:${port} (${reason})`,
+      encodedCommand,
+      command: encodedCommand
+        ? decodeSandboxedCommand(encodedCommand)
+        : undefined,
+      timestamp: new Date(),
+    })
+    return false
+  }
+
   if (!config) {
     logForDebugging('No config available, denying network request')
-    return false
+    return denied('no sandbox config')
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -127,7 +146,7 @@ async function filterNetworkRequest(
     logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
       level: 'error',
     })
-    return false
+    return denied('malformed host')
   }
 
   // Canonicalize so string comparisons match what getaddrinfo() will dial.
@@ -139,7 +158,7 @@ async function filterNetworkRequest(
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(canonicalHost, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return false
+      return denied(`matched deniedDomains entry ${deniedDomain}`)
     }
   }
 
@@ -155,7 +174,7 @@ async function filterNetworkRequest(
   // allowlist deterministic enforcement: never fall through to the callback.
   if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return false
+    return denied('not in allowlist')
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
@@ -164,15 +183,14 @@ async function filterNetworkRequest(
     if (userAllowed) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
-    } else {
-      logForDebugging(`User denied: ${host}:${port}`)
-      return false
     }
+    logForDebugging(`User denied: ${host}:${port}`)
+    return denied('user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
     })
-    return false
+    return denied('permission callback error')
   }
 }
 
@@ -287,8 +305,8 @@ async function startHttpProxyServer(
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, _socket, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     getMitmSocketPath,
     mitmCA,
     filterRequest: config?.network.filterRequest,
@@ -325,8 +343,8 @@ async function startSocksProxyServer(
   excludePorts: ReadonlySet<number>,
 ): Promise<number> {
   socksProxyServer = createSocksProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
     proxyAuthToken,
   })

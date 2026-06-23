@@ -841,6 +841,7 @@ export function wrapCommandWithSandboxMacOS(
     socksProxyPort,
     caCertPath,
     proxyAuthToken,
+    encodeSandboxedCommand(command),
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the

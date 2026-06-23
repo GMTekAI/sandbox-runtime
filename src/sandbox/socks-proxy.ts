@@ -10,9 +10,14 @@ import {
   selectParentProxyUrl,
   shouldBypassParentProxy,
 } from './parent-proxy.js'
+import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 
 export interface SocksProxyServerOptions {
-  filter(port: number, host: string): Promise<boolean> | boolean
+  filter(
+    port: number,
+    host: string,
+    encodedCommand?: string,
+  ): Promise<boolean> | boolean
 
   /**
    * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
@@ -24,7 +29,9 @@ export interface SocksProxyServerOptions {
   /**
    * Per-session token (same value as the HTTP proxy's). When set, the
    * server requires SOCKS5 username/password auth and only accepts
-   * user "srt" with this token as the password.
+   * usernames of the form `srt` or `srt.<encodedCommand>` with this token
+   * as the password. The `<encodedCommand>` suffix is passed to `filter()`
+   * so denials can be attributed to a specific command.
    */
   proxyAuthToken?: string
 }
@@ -44,7 +51,10 @@ export function createSocksProxyServer(
 
   if (options.proxyAuthToken) {
     socksServer.setAuthHandler((conn, accept, deny) => {
-      if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
+      if (
+        (conn.username === 'srt' || conn.username.startsWith('srt.')) &&
+        conn.password === options.proxyAuthToken
+      ) {
         accept()
       } else {
         logForDebugging('SOCKS auth rejected', { level: 'error' })
@@ -57,6 +67,7 @@ export function createSocksProxyServer(
     try {
       const hostname = conn.destAddress
       const port = conn.destPort
+      const encodedCommand = encodedCommandFromProxyUser(conn.username)
 
       // SOCKS5 DOMAINNAME is a raw length-prefixed byte string with zero
       // validation from the protocol or the library. Reject control chars
@@ -72,7 +83,7 @@ export function createSocksProxyServer(
 
       logForDebugging(`Connection request to ${hostname}:${port}`)
 
-      const allowed = await options.filter(port, hostname)
+      const allowed = await options.filter(port, hostname, encodedCommand)
 
       if (!allowed) {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {

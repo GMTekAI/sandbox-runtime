@@ -317,11 +317,22 @@ export function generateProxyEnvVars(
   socksProxyPort?: number,
   caCertPath?: string,
   proxyAuthToken?: string,
+  encodedCommand?: string,
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
-  const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
+  //
+  // The username carries the per-command encodedCommand so the proxy can
+  // attribute denials to a specific Bash invocation (see
+  // SandboxViolationStore). Standard base64 is percent-encoded in the URL so
+  // `+/=` survive userinfo parsing; clients URL-decode before building the
+  // Basic header / RFC 1929 frame, so the proxy receives the raw base64.
+  const userRaw = encodedCommand ? `srt.${encodedCommand}` : 'srt'
+  const userPct = encodedCommand
+    ? `srt.${encodeURIComponent(encodedCommand)}`
+    : 'srt'
+  const auth = proxyAuthToken ? `${userPct}:${proxyAuthToken}@` : ''
   // Respect the caller-provided temp dir if set, otherwise fall back to
   // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
   // kept for backwards compatibility (#141).
@@ -399,7 +410,9 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
-      const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : ''
+      const socatAuth = proxyAuthToken
+        ? `,proxyauth=${userRaw}:${proxyAuthToken}`
+        : ''
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
@@ -442,7 +455,7 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
       if (proxyAuthToken) {
-        envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`)
+        envVars.push(`CLOUDSDK_PROXY_USERNAME=${userRaw}`)
         envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
       }
     }
@@ -479,6 +492,21 @@ export function encodeSandboxedCommand(command: string): string {
  */
 export function decodeSandboxedCommand(encodedCommand: string): string {
   return Buffer.from(encodedCommand, 'base64').toString('utf8')
+}
+
+/**
+ * Extract the encodedCommand suffix from a proxy username of the form
+ * `srt` or `srt.<encodedCommand>`. Returns the encodedCommand (raw base64,
+ * matching {@link encodeSandboxedCommand}) or undefined when the username
+ * is bare `srt` / unrecognized. Used by the HTTP and SOCKS proxies to
+ * attribute denials to the originating Bash command.
+ */
+export function encodedCommandFromProxyUser(
+  username: string | undefined,
+): string | undefined {
+  if (!username) return undefined
+  const m = /^srt\.(.+)$/.exec(username)
+  return m?.[1]
 }
 
 /**

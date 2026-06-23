@@ -10,6 +10,7 @@ import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import {
   generateProxyEnvVars,
+  encodeSandboxedCommand,
   normalizePathForSandbox,
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
@@ -1321,6 +1322,7 @@ export async function wrapCommandWithSandboxLinux(
           1080, // Internal SOCKS listener port
           caCertPath,
           proxyAuthToken,
+          encodeSandboxedCommand(command),
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

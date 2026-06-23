@@ -3,7 +3,10 @@ import * as path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import { generateProxyEnvVars } from './sandbox-utils.js'
+import {
+  generateProxyEnvVars,
+  encodeSandboxedCommand,
+} from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 
 /**
@@ -587,6 +590,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       p.socksProxyPort,
       undefined,
       p.proxyAuthToken,
+      encodeSandboxedCommand(p.command),
     ),
   )
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it

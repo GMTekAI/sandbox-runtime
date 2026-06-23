@@ -7,6 +7,7 @@ import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -34,6 +35,7 @@ export interface HttpProxyServerOptions {
     port: number,
     host: string,
     socket: Socket | Duplex,
+    encodedCommand?: string,
   ): Promise<boolean> | boolean
 
   /**
@@ -88,9 +90,11 @@ export interface HttpProxyServerOptions {
 
   /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
-   * request must carry `Proxy-Authorization: Basic base64("srt:<token>")`
-   * or it gets a 407. Without this, any host process can dial 127.0.0.1
-   * and reach the filter callback.
+   * request must carry `Proxy-Authorization: Basic
+   * base64("srt[.<encodedCommand>]:<token>")` or it gets a 407. Without
+   * this, any host process can dial 127.0.0.1 and reach the filter
+   * callback. The optional `<encodedCommand>` suffix is parsed and passed
+   * to `filter()` so denials can be attributed to a specific command.
    */
   proxyAuthToken?: string
 }
@@ -98,13 +102,20 @@ export interface HttpProxyServerOptions {
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
-  const checkAuth = (got: string | undefined): boolean => {
-    if (!options.proxyAuthToken) return true
+  type AuthResult = { ok: true; encodedCommand?: string } | { ok: false }
+  const checkAuth = (got: string | undefined): AuthResult => {
+    if (!options.proxyAuthToken) return { ok: true }
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
-    if (!m) return false
+    if (!m) return { ok: false }
     const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
     const sep = decoded.indexOf(':')
-    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+    if (sep <= 0 || decoded.slice(sep + 1) !== options.proxyAuthToken) {
+      return { ok: false }
+    }
+    return {
+      ok: true,
+      encodedCommand: encodedCommandFromProxyUser(decoded.slice(0, sep)),
+    }
   }
 
   // Handle CONNECT requests for HTTPS traffic
@@ -121,7 +132,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         socket.end(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
@@ -138,7 +150,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       const { hostname, port } = target
 
-      const allowed = await options.filter(port, hostname, socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -260,7 +277,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   // Handle regular HTTP requests
   server.on('request', async (req, res) => {
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()
         return
@@ -273,7 +291,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           ? 443
           : 80
 
-      const allowed = await options.filter(port, hostname, req.socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        req.socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
