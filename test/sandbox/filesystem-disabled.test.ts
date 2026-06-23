@@ -131,6 +131,40 @@ describe.if(isSupportedPlatform)('filesystem.disabled', () => {
     expect(result.stdout).toContain(TEST_CONTENT)
   })
 
+  it('leaves TMPDIR untouched when disabled is true', async () => {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(baseConfig(true))
+
+    const marker = join(TEST_DIR, 'host-tmpdir')
+    const wrapped = await SandboxManager.wrapWithSandbox('printf %s "$TMPDIR"')
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+      env: { ...process.env, TMPDIR: marker },
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toBe(marker)
+  })
+
+  it('overrides TMPDIR when disabled is false (control)', async () => {
+    await SandboxManager.reset()
+    await SandboxManager.initialize(baseConfig(false))
+
+    const marker = join(TEST_DIR, 'host-tmpdir')
+    const wrapped = await SandboxManager.wrapWithSandbox('printf %s "$TMPDIR"')
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+      env: { ...process.env, TMPDIR: marker },
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).not.toBe(marker)
+  })
+
   it('per-call customConfig.filesystem overrides global disabled', async () => {
     await SandboxManager.reset()
     await SandboxManager.initialize(baseConfig(true))

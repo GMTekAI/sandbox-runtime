@@ -1324,6 +1324,7 @@ export async function wrapCommandWithSandboxLinux(
           1080, // Internal SOCKS listener port
           caCertPath,
           proxyAuthToken,
+          writeConfig === undefined,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

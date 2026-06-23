@@ -317,17 +317,26 @@ export function generateProxyEnvVars(
   socksProxyPort?: number,
   caCertPath?: string,
   proxyAuthToken?: string,
+  skipTmpdir?: boolean,
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
   const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
-  // Respect the caller-provided temp dir if set, otherwise fall back to
-  // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
-  // kept for backwards compatibility (#141).
-  const tmpdir =
-    process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || '/tmp/claude'
-  const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`]
+  const envVars: string[] = [`SANDBOX_RUNTIME=1`]
+  // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
+  // allows (getDefaultWritePaths). When filesystem policy is disabled
+  // (writeConfig === undefined → skipTmpdir), the host TMPDIR is already
+  // writable and /tmp/claude may not exist, so leave it untouched.
+  // CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is kept for
+  // backwards compatibility (#141).
+  if (!skipTmpdir) {
+    const tmpdir =
+      process.env.CLAUDE_CODE_TMPDIR ||
+      process.env.CLAUDE_TMPDIR ||
+      '/tmp/claude'
+    envVars.push(`TMPDIR=${tmpdir}`)
+  }
 
   // When TLS termination is configured, the child only ever sees proxy-minted
   // certs signed by the configured CA. Point the common per-tool trust-store
