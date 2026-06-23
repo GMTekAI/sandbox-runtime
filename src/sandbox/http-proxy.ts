@@ -60,6 +60,19 @@ export interface HttpProxyServerOptions {
   filterRequest?: FilterRequestCallback
 
   /**
+   * Called when {@link filterRequest} denies a request, with the verified
+   * method/URL, the decision reason, and the encodedCommand parsed from the
+   * Proxy-Authorization username. Lets the manager record the deny in the
+   * SandboxViolationStore alongside the host-allowlist denials.
+   */
+  onFilterRequestDenied?: (info: {
+    method: string
+    url: string
+    reason: string
+    encodedCommand?: string
+  }) => void
+
+  /**
    * Mutate forwarded headers on the TLS-terminated path, after the allow
    * decision and before the upstream request is built. The upstream leg is
    * always cert-verified (rejectUnauthorized defaults to true), so the TLS
@@ -198,7 +211,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             options.mutateHeaders,
             socket,
             peeked.head,
-            { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            {
+              hostname,
+              port,
+              upstreamCA: options.tlsTerminateUpstreamCA,
+              onFilterRequestDeny: options.onFilterRequestDenied
+                ? (method, url, reason) =>
+                    options.onFilterRequestDenied!({
+                      method,
+                      url,
+                      reason,
+                      encodedCommand: auth.encodedCommand,
+                    })
+                : undefined,
+            },
           )
           return
         }
@@ -345,6 +371,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res,
           absUrl,
           ac.signal,
+          options.onFilterRequestDenied
+            ? (method, url, reason) =>
+                options.onFilterRequestDenied!({
+                  method,
+                  url,
+                  reason,
+                  encodedCommand: auth.encodedCommand,
+                })
+            : undefined,
         )
         if (out === null) return
         body = out

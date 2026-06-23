@@ -169,4 +169,48 @@ describe('HTTP proxy threads encodedCommand from Basic auth to filter()', () => 
     expect(resp).toContain('HTTP/1.1 407')
     expect(seen).toEqual([])
   })
+
+  it('threads encodedCommand to onFilterRequestDenied on plain-HTTP filterRequest deny', async () => {
+    const TOKEN = 'sekrit'
+    type Denied = {
+      method: string
+      url: string
+      reason: string
+      encodedCommand?: string
+    }
+    const denied: Denied[] = []
+    proxy = createHttpProxyServer({
+      filter: () => true,
+      filterRequest: async () => ({ action: 'deny', reason: 'policy says no' }),
+      onFilterRequestDenied: info => denied.push(info),
+      proxyAuthToken: TOKEN,
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    const port = (proxy.address() as { port: number }).port
+
+    const enc = encodeSandboxedCommand('curl http://blocked.test/x')
+    const sock = connect(port, '127.0.0.1')
+    await once(sock, 'connect')
+    const basic = Buffer.from(`srt.${enc}:${TOKEN}`).toString('base64')
+    sock.write(
+      `GET http://blocked.test/x HTTP/1.1\r\n` +
+        `Host: blocked.test\r\n` +
+        `Proxy-Authorization: Basic ${basic}\r\n\r\n`,
+    )
+    const chunks: Buffer[] = []
+    sock.on('data', d => chunks.push(d))
+    await once(sock, 'close')
+    const resp = Buffer.concat(chunks).toString('utf8')
+
+    expect(resp).toContain('HTTP/1.1 403')
+    expect(denied).toEqual([
+      {
+        method: 'GET',
+        url: 'http://blocked.test/x',
+        reason: 'policy says no',
+        encodedCommand: enc,
+      },
+    ])
+  })
 })

@@ -75,10 +75,12 @@ export async function decideAndRespond(
   res: ServerResponse,
   url: string,
   signal: AbortSignal,
+  onDeny?: (method: string, url: string, reason: string) => void,
 ): Promise<Readable | null> {
+  const method = req.method ?? 'GET'
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
-  if (!BODYLESS_METHODS.has(req.method ?? 'GET')) {
+  if (!BODYLESS_METHODS.has(method)) {
     const web = Readable.toWeb(req) as ReadableStream<Uint8Array>
     const [a, b] = web.tee()
     forCallback = a
@@ -88,17 +90,16 @@ export async function decideAndRespond(
   let webReq: Request
   try {
     webReq = new Request(url, {
-      method: req.method,
+      method,
       headers: incomingHeaders(req),
       signal,
       ...(forCallback ? { body: forCallback, duplex: 'half' as const } : {}),
     })
   } catch (err) {
     // Malformed URL/headers from the client — deny rather than crash.
-    deny(res, {
-      action: 'deny',
-      reason: `malformed request: ${(err as Error).message}`,
-    })
+    const reason = `malformed request: ${(err as Error).message}`
+    onDeny?.(method, url, reason)
+    deny(res, { action: 'deny', reason })
     void forCallback?.cancel()
     forUpstream.destroy()
     return null
@@ -122,10 +123,11 @@ export async function decideAndRespond(
   }
 
   if (decision.action === 'allow') {
-    logForDebugging(`[request-filter] allow ${req.method} ${url}`)
+    logForDebugging(`[request-filter] allow ${method} ${url}`)
     return forUpstream
   }
 
+  onDeny?.(method, url, decision.reason ?? 'denied by filterRequest')
   deny(res, decision)
   forUpstream.destroy()
   return null

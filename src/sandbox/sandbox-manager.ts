@@ -310,6 +310,16 @@ async function startHttpProxyServer(
     getMitmSocketPath,
     mitmCA,
     filterRequest: config?.network.filterRequest,
+    onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
+      sandboxViolationStore.addViolation({
+        line: `deny http-request ${method} ${url} (${reason})`,
+        encodedCommand,
+        command: encodedCommand
+          ? decodeSandboxedCommand(encodedCommand)
+          : undefined,
+        timestamp: new Date(),
+      })
+    },
     // TLS-terminated path always gets the injector; the plain-HTTP path
     // only when explicitly opted in. Without the opt-in, a sentinel sent
     // over plain HTTP reaches the upstream unchanged (fails closed).
