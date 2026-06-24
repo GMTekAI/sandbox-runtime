@@ -627,10 +627,10 @@ function getCredentialRestrictions(
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
-  // entries are skipped (same posture as an unset masked env var). An
-  // `extract` entry whose pattern matches nothing degrades to deny —
-  // merged into denyReadPaths below so both the read-deny config and the
-  // platform builders see it.
+  // entries are skipped (same posture as an unset masked env var).
+  // degradeToDenyPaths is currently always empty (extract-no-match now
+  // fails open with a stderr warning) but kept plumbed through to
+  // denyReadPaths below for a future onExtractNoMatch option.
   const { binds: maskedFileBinds, degradeToDenyPaths } = buildMaskedFileBinds(
     files,
     allowedDomains ?? [],
