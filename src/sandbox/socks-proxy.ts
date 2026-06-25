@@ -35,6 +35,15 @@ export interface SocksProxyWrapper {
   listen(port: number, hostname: string): Promise<number>
   close(): Promise<void>
   unref(): void
+  /**
+   * Hand an already-accepted socket to the SOCKS state machine. Used by the
+   * mux front-end after first-byte sniffing. The socket must carry the full
+   * SOCKS greeting starting at byte 0 (i.e. any peeked bytes already
+   * `unshift()`ed back). Replicates the library's own accept path
+   * (`setNoDelay()` + `_handleConnection`) plus this wrapper's open-socket
+   * tracking, so `close()` still force-destroys injected connections.
+   */
+  handleConnection(socket: Socket): void
 }
 
 export function createSocksProxyServer(
@@ -162,6 +171,12 @@ export function createSocksProxyServer(
 
   return {
     server: socksServer,
+    handleConnection(socket: Socket): void {
+      socket.setNoDelay()
+      openSockets.add(socket)
+      socket.once('close', () => openSockets.delete(socket))
+      socksServer._handleConnection(socket)
+    },
     getPort(): number | undefined {
       // Access the internal server to get the port
       // We need to use type assertion here as the server property is private
