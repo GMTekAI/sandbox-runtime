@@ -121,7 +121,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'

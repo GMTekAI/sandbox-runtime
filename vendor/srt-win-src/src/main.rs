@@ -418,7 +418,7 @@ enum WfpCmd {
         sublayer_guid: Option<String>,
         /// Loopback port range the sandboxed child may reach
         /// (`LOW-HIGH`, inclusive; default 60080-60089). The host
-        /// http/socks proxies bind inside this range on Windows.
+        /// mux proxy listeners bind inside this range on Windows.
         #[arg(long, value_name = "LOW-HIGH")]
         proxy_port_range: Option<String>,
     },

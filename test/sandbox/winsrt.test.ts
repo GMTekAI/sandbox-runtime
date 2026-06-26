@@ -710,10 +710,10 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   // ── loopback port-range fence (filter-2 / filter-3) — kept ───────
 
   it('C6: child reaches an IN-range loopback port (filter-2 PERMIT)', async () => {
-    // Bind a listener on a free IN-range port that is NOT one of the
-    // live JS proxy ports (those also live in the range). Walk the
-    // range top-down, skipping the proxy ports, so we never collide
-    // with them (which would EADDRINUSE) and never curl a proxy port.
+    // Bind a listener on a free IN-range port that is NOT the mux
+    // front-end port (httpP === socksP with the in-process proxy).
+    // The http-backend port also lives in the range; bindFirstFree
+    // EADDRINUSE-skips it. Walk top-down so we never curl a proxy port.
     const httpP = SandboxManager.getProxyPort()
     const socksP = SandboxManager.getSocksProxyPort()
     const candidates: number[] = []

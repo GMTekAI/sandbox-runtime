@@ -25,7 +25,7 @@ import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
  * keyed on that group's SID, and an `exec` subcommand that spawns the
  * target under a restricted token (group flipped deny-only) inside a
  * hardened job. The sandboxed child reaches the host only via the JS
- * http/socks proxies, which `srt-win exec` points at via env vars.
+ * mux proxy, which `srt-win exec` points at via env vars.
  *
  * This module is a thin wrapper around the `srt-win` CLI; all status
  * comes from live enumeration (group via `LookupAccountNameW` +
@@ -159,9 +159,17 @@ export interface WindowsSandboxParams {
    * GUID — same as `srt-win install` with no `--sublayer-guid`.
    */
   sublayerGuid?: string
-  /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the returned env. */
+  /**
+   * JS HTTP proxy port — fed to `generateProxyEnvVars` for the
+   * returned env. With the in-process proxy this is the mux
+   * front-end port (same as `socksProxyPort`).
+   */
   httpProxyPort?: number
-  /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the returned env. */
+  /**
+   * JS SOCKS proxy port — fed to `generateProxyEnvVars` for the
+   * returned env. With the in-process proxy this is the mux
+   * front-end port (same as `httpProxyPort`).
+   */
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string

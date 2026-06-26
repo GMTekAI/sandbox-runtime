@@ -1319,7 +1319,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * Update the sandbox configuration in place.
  *
  * **Network/allowlist changes are a live swap**: the running
- * http/socks proxies read `config.network.allowedDomains` /
+ * mux proxy reads `config.network.allowedDomains` /
  * `deniedDomains` per-request (via `filterNetworkRequest`), so
  * reassigning `config` here takes effect on the next connection
  * with no proxy rebind and no port change — on every platform,
