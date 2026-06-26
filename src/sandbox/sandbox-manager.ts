@@ -1284,6 +1284,7 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      caCertPath: mitmCA?.trustBundlePath,
       unsetEnvVars: credentialRestrictions.unsetEnvVars,
       setEnvVars: credentialRestrictions.setEnvVars,
       // Engage the per-exec dir/file fence only when this session

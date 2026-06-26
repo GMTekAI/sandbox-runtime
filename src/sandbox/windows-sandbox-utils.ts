@@ -166,6 +166,18 @@ export interface WindowsSandboxParams {
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
   /**
+   * Path to the TLS-termination trust bundle (the MITM CA + system
+   * roots) — fed to {@link generateProxyEnvVars} so the sandboxed
+   * child's `NODE_EXTRA_CA_CERTS` / `CURL_CA_BUNDLE` /
+   * `SSL_CERT_FILE` / etc. point at it. Backslashes are normalised
+   * to forward slashes before emission so the value survives msys2
+   * env conversion AND is accepted by native tools. Trust is
+   * env-only on Windows: schannel/.NET clients that read the
+   * Windows certificate store exclusively (System32 `curl.exe`,
+   * `Invoke-WebRequest`, Go-built tools) are NOT covered.
+   */
+  caCertPath?: string
+  /**
    * Credential env vars to drop from the inherited environment
    * (`mode: 'deny'`). Applied BEFORE the proxy assignments so the
    * sandbox's own proxy plumbing survives even if a caller lists
@@ -886,11 +898,16 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   // Generated proxy vars override any inherited (or just-masked)
   // ones so the child always routes through this sandbox's proxies.
+  // The CA trust-bundle path is emitted with forward slashes:
+  // msys2's POSIX-path conversion leaves `C:/…` alone and every
+  // tool we set the var for (curl, git, node, python, …) accepts
+  // forward slashes on Windows; backslashes would be mangled if
+  // the value passes through a bash command line.
   const generated = envListToObject(
     generateProxyEnvVars(
       p.httpProxyPort,
       p.socksProxyPort,
-      undefined,
+      p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
     ),
   )
