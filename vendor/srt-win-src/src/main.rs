@@ -80,10 +80,26 @@ enum Cmd {
     ///
     /// Self-elevates via UAC if not already admin. Does NOT
     /// delete the discriminator group — use `srt-win group
-    /// delete --name <N>` for that explicitly.
+    /// delete --name <N>` for that explicitly. **Does** remove
+    /// the sandbox user account, its credential file, and the
+    /// setup marker, unless `--keep-user`.
     Uninstall {
         #[arg(long)]
         sublayer_guid: Option<String>,
+        /// Keep the `srt-sandbox` account, its credential file,
+        /// and the setup marker. Without this flag they are all
+        /// removed (the credential is useless without the
+        /// account and vice versa, so they're treated as one
+        /// unit).
+        #[arg(long)]
+        keep_user: bool,
+    },
+    /// Inspect the sandbox user account that `srt-win install`
+    /// provisions (and that the sandboxed child eventually runs
+    /// as).
+    User {
+        #[command(subcommand)]
+        sub: UserCmd,
     },
     /// Manage the local discriminator group.
     Group {
@@ -198,6 +214,23 @@ struct GroupRef {
     /// lookup may be unreliable.
     #[arg(long)]
     group_sid: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Print the sandbox user's provisioning state as JSON:
+    /// `{user: {exists, sid?, group_exists, group_sid?,
+    /// in_builtin_users, in_sandbox_group, hidden_from_logon},
+    /// cred_file_readable, marker_version?}`.
+    Status,
+    /// Print the sandbox user's decrypted password (and only the
+    /// password) to stdout. The broker uses this for
+    /// `CreateProcessWithLogonW`. Fails when run as the sandbox
+    /// user itself — the credential file's directory carries an
+    /// explicit DENY for `sandbox-runtime-users`, and
+    /// machine-scope DPAPI is **not** a confidentiality boundary
+    /// without that DENY.
+    ReadCred,
 }
 
 #[derive(Subcommand)]
@@ -744,10 +777,38 @@ fn run() -> anyhow::Result<()> {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
+            // Sandbox user account + credential file + setup
+            // marker. Additive: the discriminator-group path above
+            // is unchanged. Failures here exit 14 so the caller
+            // can distinguish "group/WFP fine, user provisioning
+            // failed" from the legacy 11/12 codes.
+            let user_step = || -> anyhow::Result<srt_win::user::ProvisionedUser> {
+                use srt_win::{install, user};
+                let pu = user::provision()
+                    .context("provision sandbox user")?;
+                install::write_cred_file(&pu, &gsid)
+                    .context("write sandbox credential file")?;
+                install::write_setup_marker(&pu)
+                    .context("write setup marker")?;
+                Ok(pu)
+            };
+            let pu = match user_step() {
+                Ok(pu) => pu,
+                Err(e) => {
+                    eprintln!("srt-win: error: sandbox user step: {e:#}");
+                    std::process::exit(14);
+                }
+            };
             eprintln!(
                 "srt-win: installed (group={label} sid={gsid}, sublayer={sl:?}, \
                  proxy_port_range={}-{}, filters=8)",
                 range.0, range.1,
+            );
+            eprintln!(
+                "srt-win: sandbox user '{}' provisioned (sid={}, \
+                 group={} sid={})",
+                pu.username, pu.sid,
+                srt_win::user::SANDBOX_GROUP, pu.group_sid,
             );
             eprintln!(
                 "srt-win: NOTE — log out and back in before running \
@@ -755,17 +816,65 @@ fn run() -> anyhow::Result<()> {
                  logon; your network is unaffected meanwhile)."
             );
         }
-        Cmd::Uninstall { sublayer_guid } => {
+        Cmd::Uninstall { sublayer_guid, keep_user } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
+            let user_note = if keep_user {
+                "Sandbox user kept (--keep-user)."
+            } else {
+                use srt_win::{install, user};
+                install::remove_artifacts()
+                    .context("remove credential file / setup marker")?;
+                user::deprovision().context("deprovision sandbox user")?;
+                "Sandbox user, credential file, and setup marker removed."
+            };
             eprintln!(
                 "srt-win: uninstalled ({n} filter(s) removed). \
                  Group is left intact — run `srt-win group delete` \
-                 to remove it."
+                 to remove it. {user_note}"
             );
+        }
+
+        // ─── user ──────────────────────────────────────────────────
+        Cmd::User { sub: UserCmd::Status } => {
+            use srt_win::{install, user};
+            let st = user::status()?;
+            let cred_readable = install::cred_file_path()
+                .and_then(|p| {
+                    std::fs::metadata(&p)
+                        .map(|_| true)
+                        .or_else(|e| {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                Ok(false)
+                            } else {
+                                Err(anyhow!(
+                                    "stat {}: {e}",
+                                    p.display()
+                                ))
+                            }
+                        })
+                })
+                .unwrap_or(false);
+            let marker = install::read_setup_marker().ok().flatten();
+            println!(
+                "{}",
+                json!({
+                    "user": st,
+                    "cred_file_readable": cred_readable,
+                    "marker_version": marker.as_ref().map(|m| m.version),
+                    "marker_user_sid": marker.as_ref()
+                        .map(|m| m.sandbox_user_sid.clone()),
+                })
+            );
+        }
+        Cmd::User { sub: UserCmd::ReadCred } => {
+            let (_, pw) = srt_win::install::read_cred()?;
+            // Password only, no trailing whitespace, so a caller
+            // can capture stdout verbatim.
+            print!("{pw}");
         }
 
         // ─── group ─────────────────────────────────────────────────

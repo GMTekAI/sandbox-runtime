@@ -355,7 +355,42 @@ fn open_db(group_sid: &str) -> Result<Connection> {
             dir.display()
         )
     })?;
-    if let Err(e) = acl::stamp_dir_inheriting(dir_str, group_sid) {
+    // Include the sandbox-users DENY when the install has
+    // provisioned that group. The credential file in this
+    // directory is machine-scope DPAPI — readable-by-sandbox =
+    // decryptable-by-sandbox — so the DENY is load-bearing once
+    // the separate-user runner exists. The lookup distinguishes
+    // "group genuinely absent" (install never run / older install
+    // → DENY skipped, broker-only allow set still excludes the
+    // sandbox user) from a transient SAM/LSA failure — the latter
+    // is surfaced rather than silently dropping a security ACE.
+    let deny_sid = match crate::sid::lookup_account_sid(
+        crate::user::SANDBOX_GROUP,
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            match crate::sid::sid_account_exists("S-1-5-32-545") {
+                // BUILTIN\Users always maps; if it does, SAM is up
+                // and the sandbox group is genuinely absent.
+                Ok(crate::sid::SidExistence::Mapped) => None,
+                _ => {
+                    eprintln!(
+                        "srt-win: WARNING: cannot resolve \
+                         '{}' to add the state-dir DENY ACE \
+                         ({e:#}); the broker-only allow set \
+                         still excludes the sandbox user, but \
+                         the explicit DENY is omitted for this \
+                         stamp",
+                        crate::user::SANDBOX_GROUP,
+                    );
+                    None
+                }
+            }
+        }
+    };
+    if let Err(e) =
+        acl::stamp_dir_inheriting(dir_str, group_sid, deny_sid.as_deref())
+    {
         eprintln!(
             "srt-win: WARNING: failed to stamp state-DB dir {} \
              broker-only: {e:#}",

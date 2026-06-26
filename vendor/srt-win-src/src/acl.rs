@@ -1134,16 +1134,94 @@ pub fn stamp_file_apply(
 }
 
 /// Apply the broker-only DACL to a directory with `(OI)(CI)`
-/// inheritance. Used by `state_db.rs` to protect
-/// `%LOCALAPPDATA%\sandbox-runtime\`. NOT exposed to the CLI —
-/// directory targets in `acl stamp` are not yet supported.
+/// inheritance, optionally **prefixed** by a `(D;OICI;FA;;;
+/// <deny_sid>)` ACE. Used by `state_db.rs` and `install.rs` to
+/// protect `%LOCALAPPDATA%\sandbox-runtime\`.
+///
+/// `deny_sid` is the [`crate::user::SANDBOX_GROUP`] SID when the
+/// sandbox user has been provisioned: the credential file in this
+/// directory is encrypted with **machine-scope** DPAPI, which any
+/// local account can decrypt — so the sandbox account MUST NOT be
+/// able to read it. The broker-only `PROTECTED` allow set already
+/// excludes the sandbox user (it's not in `<group_sid>` / SYSTEM /
+/// Admins), but the explicit DENY makes that intent visible in
+/// `Get-Acl` and survives any future widening of the allow set.
+///
+/// Built via SDDL because [`build_allow_dacl`] only emits ALLOW
+/// ACEs (plus the marker DENY), and adding a generic DENY row to
+/// the [`Allow`]/[`ParsedAces`] table would invite misuse in the
+/// per-file stamp paths where DENY ACEs interact badly with
+/// inheritance. NOT exposed to the CLI — directory targets in
+/// `acl stamp` are not yet supported.
 pub fn stamp_dir_inheriting(
     canonical_path: &str,
     group_sid: &str,
+    deny_sid: Option<&str>,
 ) -> Result<()> {
-    let dacl =
-        build_broker_only_dacl(group_sid, AclMask::ReadDeny, true, None)?;
-    set_file_dacl_protected(canonical_path, &dacl, "state-db dir")
+    let deny = deny_sid
+        .map(|s| format!("(D;OICI;FA;;;{s})"))
+        .unwrap_or_default();
+    // Same trustees and masks as `broker_only_aces(ReadDeny,
+    // inherit=true)`: <group>/SY/BA = FILE_ALL `(OI)(CI)`,
+    // OWNER_RIGHTS = READ_CONTROL `(OI)(CI)`. SDDL's `FA` =
+    // `FILE_ALL_ACCESS`; `RC` = `READ_CONTROL`; `S-1-3-4` =
+    // OWNER_RIGHTS. Canonical ACE order = DENY before ALLOW.
+    let sddl = format!(
+        "D:P{deny}\
+         (A;OICI;FA;;;{group_sid})\
+         (A;OICI;FA;;;SY)\
+         (A;OICI;FA;;;BA)\
+         (A;OICI;RC;;;S-1-3-4)"
+    );
+    set_path_dacl_from_sddl(canonical_path, &sddl, "state-db dir")
+}
+
+/// SDDL → SD → DACL pointer → `SetNamedSecurityInfoW(PROTECTED)`.
+/// One-shot helper for the few call sites that need a DENY ACE
+/// (which the [`BuiltAcl`] machinery deliberately doesn't expose).
+/// The `D:P` prefix in `sddl` is informational; `PROTECTED` is set
+/// here regardless via `PROTECTED_DACL_SECURITY_INFORMATION`.
+pub fn set_path_dacl_from_sddl(
+    path: &str,
+    sddl: &str,
+    label: &str,
+) -> Result<()> {
+    use windows::Win32::Security::GetSecurityDescriptorDacl;
+    let sd = crate::util::OwnedSd::from_sddl(sddl)
+        .with_context(|| format!("{label}: build SD from SDDL"))?;
+    let mut present = windows::core::BOOL::from(false);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = windows::core::BOOL::from(false);
+    unsafe {
+        GetSecurityDescriptorDacl(
+            sd.ptr, &mut present, &mut dacl, &mut defaulted,
+        )
+        .with_context(|| format!("{label}: GetSecurityDescriptorDacl"))?;
+    }
+    if !present.as_bool() || dacl.is_null() {
+        bail!("{label}: SDDL '{sddl}' yielded no DACL");
+    }
+    let w = wstr(path);
+    let r = unsafe {
+        SetNamedSecurityInfoW(
+            pcwstr(&w),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if r.is_err() {
+        bail!(
+            "SetNamedSecurityInfoW({label} '{path}'): \
+             WIN32_ERROR=0x{:08x}",
+            r.0
+        );
+    }
+    Ok(())
 }
 
 /// Build + apply the parent allow-list (DACL+marker, `PROTECTED`).
