@@ -418,13 +418,16 @@ export function generateProxyEnvVars(
     return envVars
   }
 
-  // Always set NO_PROXY to exclude localhost and private networks from proxying
+  // Always set NO_PROXY to exclude localhost and private networks from
+  // proxying. *.local is intentionally absent: under network restriction the
+  // child has no usable resolver/routes (bwrap --unshare-net on Linux,
+  // loopback-only under seatbelt), so a NO_PROXY match makes the client try
+  // direct getaddrinfo() and fail. Routing .local hostnames through the proxy
+  // lets the parent resolve them (e.g. Kubernetes *.svc.cluster.local).
   const noProxyAddresses = [
     'localhost',
     '127.0.0.1',
     '::1',
-    '*.local',
-    '.local',
     '169.254.0.0/16', // Link-local
     '10.0.0.0/8', // Private network
     '172.16.0.0/12', // Private network
