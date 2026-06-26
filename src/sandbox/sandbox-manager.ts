@@ -56,6 +56,7 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -802,10 +803,11 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  *     backend is deny-listed only; the sandboxed child writes
  *     wherever the host user can, minus `denyWrite`.
  */
-function computeWindowsFsDenySet(runtimeConfig: SandboxRuntimeConfig): {
+function computeWindowsFsDenySet(c: SandboxRuntimeConfig): {
   denyRead: string[]
   denyWrite: string[]
 } {
+  const fs = c.filesystem
   // filesystem.disabled bypasses ALL filesystem rule generation —
   // same as the macOS/Linux wrapWithSandbox path (readConfig /
   // writeConfig left undefined). On Windows this means no ACL
@@ -813,20 +815,17 @@ function computeWindowsFsDenySet(runtimeConfig: SandboxRuntimeConfig): {
   // (credential ENV scrubbing is independent and still applied at
   // wrap time). Returning empty here means initialize() applies no
   // stamp.
-  if (runtimeConfig.filesystem.disabled) {
+  if (fs?.disabled) {
     return { denyRead: [], denyWrite: [] }
   }
-  if (
-    runtimeConfig.filesystem.allowRead &&
-    runtimeConfig.filesystem.allowRead.length > 0
-  ) {
+  if (fs?.allowRead?.length) {
     throw new Error(
       `filesystem.allowRead (re-allow within denyRead) is not supported ` +
         `on Windows. Remove the entries or narrow filesystem.denyRead to ` +
         `exclude them.`,
     )
   }
-  if (runtimeConfig.filesystem.allowWrite.length > 0) {
+  if (fs?.allowWrite?.length) {
     throw new Error(
       `filesystem.allowWrite is not supported on Windows — the Windows ` +
         `sandbox is deny-listed only (the child writes wherever the host ` +
@@ -836,11 +835,11 @@ function computeWindowsFsDenySet(runtimeConfig: SandboxRuntimeConfig): {
   }
   const denyRead = expandWindowsFsDenyPaths([
     ...new Set([
-      ...runtimeConfig.filesystem.denyRead,
-      ...getCredentialDenyReadPaths(runtimeConfig.credentials),
+      ...(fs?.denyRead ?? []),
+      ...getCredentialDenyReadPaths(c.credentials),
     ]),
   ])
-  const denyWrite = expandWindowsFsDenyPaths(runtimeConfig.filesystem.denyWrite)
+  const denyWrite = expandWindowsFsDenyPaths(fs?.denyWrite ?? [])
   return { denyRead, denyWrite }
 }
 
@@ -1233,31 +1232,6 @@ async function wrapWithSandboxArgv(
   const platform = getPlatform()
 
   if (platform === 'windows') {
-    // Per-call FILE denies (whether via credentials.files or
-    // filesystem.denyRead/denyWrite) don't work on Windows — file
-    // deny is a session-lifetime ACL stamp applied at initialize(),
-    // not a per-exec profile. macOS/Linux honour customConfig for
-    // both env and file denies; on Windows only the env half can be
-    // honoured per-exec, so reject rather than silently dropping
-    // the file half.
-    if (customConfig?.credentials?.files?.some(f => f.mode === 'deny')) {
-      throw new Error(
-        `Per-exec credential file-deny via customConfig is not supported ` +
-          `on Windows (file deny is a session-lifetime ACL stamp). Add the ` +
-          `path to the session-level credentials.files or ` +
-          `filesystem.denyRead instead.`,
-      )
-    }
-    if (
-      customConfig?.filesystem?.denyRead?.length ||
-      customConfig?.filesystem?.denyWrite?.length
-    ) {
-      throw new Error(
-        `Per-exec filesystem deny via customConfig is not supported on ` +
-          `Windows (file deny is a session-lifetime ACL stamp). Add the ` +
-          `path to the session-level filesystem.denyRead/denyWrite instead.`,
-      )
-    }
     const hasNetworkConfig =
       customConfig?.network?.allowedDomains !== undefined ||
       config?.network?.allowedDomains !== undefined
@@ -1268,6 +1242,78 @@ async function wrapWithSandboxArgv(
       customConfig?.credentials ?? config?.credentials,
       customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
     )
+    // Per-exec FILE denies (customConfig only — the session-level
+    // config's denies were already stamped at initialize()).
+    // Unlike the session-level set, paths are passed through
+    // VERBATIM (normalized only): no glob expansion, no
+    // existsSync filter. `srt-win exec`'s
+    // `canonicalize_deny_targets` is the authority — it
+    // hard-fails on glob/dir/nonexistent so a missing path is a
+    // visible caller error, not a silent skip (the session-level
+    // expand-and-drop-missing was for tolerant point-in-time
+    // globs at init; per-exec is "deny THIS one command" and a
+    // path that doesn't resolve is a bug the caller must see).
+    //
+    // The dedup against `windowsFsStampedSet` is an OPTIMIZATION,
+    // not a correctness gate: re-stamping a session-held path
+    // under the exec's distinct holder is refcount-safe but
+    // wastes a SetSecurityInfo round-trip. The mask-escalation /
+    // hardlink-alias guard lives in srt-win's `ensure_stamped`
+    // (`refuse_escalation = true`), NOT here — canonical-path
+    // identity and concurrent holders are only visible to Rust.
+    //
+    // filesystem.disabled bypasses ALL filesystem rule generation
+    // — including credential-derived file denies — same ordering
+    // as session-level `computeWindowsFsDenySet` (credential ENV
+    // scrubbing is independent and still applied at wrap time).
+    // allowRead/allowWrite throw, also matching session-level:
+    // the Windows file-deny sandbox is deny-only.
+    const fsCfg = customConfig?.filesystem
+    let perExecDenyRead: string[] = []
+    let perExecDenyWrite: string[] = []
+    if (!fsCfg?.disabled) {
+      if (fsCfg?.allowRead?.length) {
+        throw new Error(
+          `Per-exec filesystem.allowRead (re-allow within denyRead) is ` +
+            `not supported on Windows. Remove the entries or narrow ` +
+            `filesystem.denyRead to exclude them.`,
+        )
+      }
+      if (fsCfg?.allowWrite?.length) {
+        throw new Error(
+          `Per-exec filesystem.allowWrite is not supported on Windows — ` +
+            `the Windows sandbox is deny-listed only (the child writes ` +
+            `wherever the host user can, minus filesystem.denyWrite). ` +
+            `Remove the allowWrite entries.`,
+        )
+      }
+      const rawRead = [
+        ...(fsCfg?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(customConfig?.credentials),
+      ]
+      const rawWrite = fsCfg?.denyWrite ?? []
+      // Skip on the dominant path (no per-exec fs or
+      // credential-file deny) — this used to call
+      // `computeWindowsFsDenySet` (glob walk + statSync per
+      // match) on every exec, including with
+      // `customConfig === undefined`.
+      if (rawRead.length > 0 || rawWrite.length > 0) {
+        const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
+        const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
+        const norm = (raw: readonly string[]) => [
+          ...new Set(raw.map(normalizePathForSandbox)),
+        ]
+        perExecDenyRead = norm(rawRead).filter(p => !sessRead.has(p))
+        perExecDenyWrite = norm(rawWrite).filter(
+          p => !sessRead.has(p) && !sessWrite.has(p),
+        )
+      }
+    }
+    // Per-exec deny rides on argv (`acl stamp` reads stdin, but
+    // exec's stdin belongs to the child). The CreateProcessW
+    // length check lives in `wrapCommandWithSandboxWindows`
+    // where the full argv (incl. shell + user command) is known.
+    //
     // Credential env restrictions are passed INTO the wrapper so it
     // can apply them BEFORE merging the proxy env (same precedence
     // as the macOS/Linux `env -u … VAR=… sandbox-exec` order — the
@@ -1275,8 +1321,7 @@ async function wrapWithSandboxArgv(
     // e.g. HTTPS_PROXY as a denied credential). The `denyReadPaths`
     // half of the SESSION-level credentials is already unioned into
     // the stamp set at initialize() time via
-    // `computeWindowsFsDenySet`; per-call file denies are rejected
-    // above.
+    // `computeWindowsFsDenySet`.
     return wrapCommandWithSandboxWindows({
       command,
       group: getWindowsGroupRef(),
@@ -1286,10 +1331,14 @@ async function wrapWithSandboxArgv(
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
       unsetEnvVars: credentialRestrictions.unsetEnvVars,
       setEnvVars: credentialRestrictions.setEnvVars,
-      // Engage the per-exec dir/file fence only when this session
+      // Engage the session-level fence only when this session
       // actually stamped — keeps `srt-win exec` standalone (no
-      // state-DB dependency) when no file-deny is configured.
+      // state-DB dependency) when no file-deny is configured. The
+      // per-exec deny below opens its own fence under the exec's
+      // own PID regardless.
       holderPid: windowsFsStampedSet ? process.pid : undefined,
+      denyRead: perExecDenyRead,
+      denyWrite: perExecDenyWrite,
       binShell: parseWindowsBinShell(binShell),
     })
   }

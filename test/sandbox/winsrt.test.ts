@@ -1335,4 +1335,202 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     ).rejects.toThrow(/allowWrite is not supported on Windows/)
     await SandboxManager.reset()
   })
+
+  it('F11: per-exec deny via customConfig — stamped, denied, restored', async () => {
+    // Session-level stamp on `secret` so we can assert it stays
+    // intact across the per-exec stamp/restore cycle.
+    writeFileSync(secret, 'TOP-SECRET')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
+    const cred = join(scratch, 'f11-cred.txt')
+    const fs2 = join(scratch, 'f11-fs.txt')
+    writeFileSync(cred, 'F11-CRED')
+    writeFileSync(fs2, 'F11-FS')
+    // Pre: broker can read both (not yet stamped).
+    expect(readFileSync(cred, 'utf8')).toBe('F11-CRED')
+    // (a) credentials.files[mode=deny] — the original throw-case.
+    const { argv: a1, env: e1 } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${cred}" & type "${secret}"`,
+      undefined,
+      { credentials: { files: [{ path: cred, mode: 'deny' }] } },
+    )
+    // The per-exec path made it onto the argv as a --deny-read
+    // flag; the session-level path (already stamped) did NOT.
+    expect(a1).toContain('--deny-read')
+    expect(a1[a1.indexOf('--deny-read') + 1]).toContain('f11-cred.txt')
+    expect(a1.filter(x => x === '--deny-read')).toHaveLength(1)
+    const r1 = await spawnAsync(a1[0], a1.slice(1), {
+      timeout: 30_000,
+      env: e1,
+    })
+    if (r1.stdout.includes('F11-CRED')) {
+      throw new Error(
+        `F11(a): child read the per-exec credential deny target — ` +
+          `stdout=${JSON.stringify(r1.stdout)} stderr=${JSON.stringify(r1.stderr)}`,
+      )
+    }
+    if (r1.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F11(a): child read the SESSION-level denyRead target — ` +
+          `session stamp lost during per-exec? ` +
+          `stderr=${JSON.stringify(r1.stderr)}`,
+      )
+    }
+    expect(r1.stderr).toMatch(/per-exec deny: holder_pid=\d+ → 1 path/)
+    // Post: per-exec stamp restored on child exit. The broker
+    // (this process) would read `cred` REGARDLESS (group enabled
+    // → matches the broker-only DACL), so prove restore via a
+    // SECOND sandboxed child with no per-exec deny — only true if
+    // the stamp was lifted.
+    const rR = await runSandboxed(`type "${cred}"`)
+    if (!rR.stdout.includes('F11-CRED')) {
+      throw new Error(
+        `F11(a): per-exec stamp NOT restored — fresh child still ` +
+          `denied. stdout=${JSON.stringify(rR.stdout)} ` +
+          `stderr=${JSON.stringify(rR.stderr)}`,
+      )
+    }
+    // Session-level stamp on `secret` survived: a fresh child
+    // (no per-exec deny) is still denied.
+    const rS = await runSandboxed(`type "${secret}"`)
+    if (rS.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F11(a): session-level stamp on '${secret}' was torn down ` +
+          `by the per-exec restore — refcount broken`,
+      )
+    }
+    // (b) filesystem.denyRead — same mechanism, different config
+    // key. Include the session-stamped `secret` to assert the
+    // per-exec set is filtered against `windowsFsStampedSet` —
+    // only `fs2` should reach the argv.
+    const { argv: a2, env: e2 } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${fs2}"`,
+      undefined,
+      { filesystem: { denyRead: [secret, fs2] } },
+    )
+    const flags2 = a2.filter(x => x === '--deny-read')
+    if (flags2.length !== 1) {
+      throw new Error(
+        `F11(b): expected exactly one --deny-read (session-stamped ` +
+          `'${secret}' should be filtered out); got ${flags2.length}: ` +
+          JSON.stringify(a2),
+      )
+    }
+    expect(a2[a2.indexOf('--deny-read') + 1]).toContain('f11-fs.txt')
+    const r2 = await spawnAsync(a2[0], a2.slice(1), {
+      timeout: 30_000,
+      env: e2,
+    })
+    if (r2.stdout.includes('F11-FS')) {
+      throw new Error(
+        `F11(b): child read the per-exec filesystem.denyRead target — ` +
+          `stdout=${JSON.stringify(r2.stdout)} stderr=${JSON.stringify(r2.stderr)}`,
+      )
+    }
+    const rR2 = await runSandboxed(`type "${fs2}"`)
+    if (!rR2.stdout.includes('F11-FS')) {
+      throw new Error(
+        `F11(b): per-exec stamp NOT restored — fresh child still denied. ` +
+          `stderr=${JSON.stringify(rR2.stderr)}`,
+      )
+    }
+    await SandboxManager.reset()
+  }, 60_000)
+
+  it('F12: per-exec refuse-escalation — ReadDeny on a session-WriteDeny path fails the exec', async () => {
+    // Session holds `cfg` at WriteDeny. A per-exec ReadDeny on the
+    // same canonical path would escalate the on-disk mask; the
+    // per-exec restore would then see refcount>0 (session holder)
+    // and leave it ReadDeny for the rest of the session. The guard
+    // lives in srt-win's `ensure_stamped` (refuse_escalation) — NOT
+    // a TS string-compare — so canonical-path identity and
+    // concurrent holders are authoritative. The exec FAILS rather
+    // than silently stick the stricter mask.
+    writeFileSync(cfg, 'CONFIG-V1')
+    await SandboxManager.initialize(createFsTestConfig({ denyWrite: [cfg] }))
+    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${cfg}"`,
+      undefined,
+      { filesystem: { denyRead: [cfg] } },
+    )
+    // The TS filter only drops same-or-stricter session matches;
+    // ReadDeny-on-WriteDeny is forwarded to srt-win.
+    expect(argv).toContain('--deny-read')
+    const r = await spawnAsync(argv[0], argv.slice(1), {
+      timeout: 30_000,
+      env,
+    })
+    if (r.status === 0) {
+      throw new Error(
+        `F12: exec succeeded — refuse-escalation guard did not fire. ` +
+          `stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    if (!/would escalate .* from WriteDeny to ReadDeny/.test(r.stderr)) {
+      throw new Error(
+        `F12: expected refuse-escalation error in stderr; got ` +
+          `status=${r.status} stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    // Mask was NOT escalated: a fresh child (no per-exec deny) can
+    // still read `cfg` (WriteDeny leaves read open). And the
+    // session WriteDeny stamp survived the failed batch's rollback.
+    const rR = await runSandboxed(`type "${cfg}"`)
+    if (!rR.stdout.includes('CONFIG-V1')) {
+      throw new Error(
+        `F12: child cannot read a WriteDeny-only file — mask was ` +
+          `escalated to ReadDeny despite refuse-escalation. ` +
+          `stderr=${JSON.stringify(rR.stderr)}`,
+      )
+    }
+    const rW = await runSandboxed(`echo POISON > "${cfg}"`)
+    if (readFileSync(cfg, 'utf8').includes('POISON')) {
+      throw new Error(
+        `F12: session WriteDeny stamp was torn down by the failed ` +
+          `per-exec batch's rollback. stderr=${JSON.stringify(rW.stderr)}`,
+      )
+    }
+    await SandboxManager.reset()
+  }, 60_000)
+
+  it('F13: per-exec deny self-registers — --holder-pid only when session stamped', async () => {
+    // Per-exec `--deny-*` stamps under the exec process's OWN
+    // pid (`std::process::id()`), not a flag-passed holder. The
+    // `--holder-pid` flag is the SESSION fence's holder and is
+    // independent — present iff this session ran `acl stamp`
+    // (windowsFsStampedSet set). Assert both halves so the two
+    // concerns can't be re-coupled.
+    await SandboxManager.reset()
+    const f13 = join(scratch, 'f13.txt')
+    writeFileSync(f13, 'F13')
+    // (a) No session-level fs deny → windowsFsStampedSet is
+    // undefined → no --holder-pid; per-exec deny still rides.
+    await SandboxManager.initialize(createFsTestConfig({}))
+    const { argv: aN } = await SandboxManager.wrapWithSandboxArgv(
+      'exit 0',
+      undefined,
+      { filesystem: { denyRead: [f13] } },
+    )
+    if (aN.includes('--holder-pid')) {
+      throw new Error(
+        `F13(a): --holder-pid present with no session stamp — ` +
+          `per-exec deny is not self-registering. argv=${JSON.stringify(aN)}`,
+      )
+    }
+    expect(aN).toContain('--deny-read')
+    await SandboxManager.reset()
+    // (b) Session-level stamp → --holder-pid present (session
+    // fence), independent of per-exec flags.
+    writeFileSync(secret, 'TOP-SECRET')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
+    const { argv: aS } = await SandboxManager.wrapWithSandboxArgv('exit 0')
+    if (!aS.includes('--holder-pid')) {
+      throw new Error(
+        `F13(b): --holder-pid absent despite session stamp — ` +
+          `session fence not engaged. argv=${JSON.stringify(aS)}`,
+      )
+    }
+    expect(aS[aS.indexOf('--holder-pid') + 1]).toBe(`${process.pid}`)
+    expect(aS).not.toContain('--deny-read')
+    await SandboxManager.reset()
+  }, 60_000)
 })

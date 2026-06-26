@@ -660,6 +660,16 @@ pub struct PrebuiltDacls {
 }
 
 impl PrebuiltDacls {
+    /// `build` keyed on the calling process's user SID. Folds the
+    /// otherwise-repeated `current_user_sid()? → build()` pair so
+    /// every call site stamps with the same DACL recipe; if `build`
+    /// gains another input (an extra well-known SID, a config flag)
+    /// there is one place to thread it.
+    pub fn for_current_user(group_sid: &str) -> Result<Self> {
+        let user_sid = crate::sid::current_user_sid()?;
+        Self::build(group_sid, &user_sid)
+    }
+
     pub fn build(group_sid: &str, user_sid: &str) -> Result<Self> {
         let read_deny = ParsedAces::parse(&broker_only_aces(
             group_sid, AclMask::ReadDeny, false,

@@ -190,6 +190,23 @@ export interface WindowsSandboxParams {
    */
   holderPid?: number
   /**
+   * Per-exec read-deny paths, stamped under the `srt-win exec`
+   * process's own PID and restored after the child exits. Same
+   * disk-first chokepoint as the session-level
+   * {@link stampWindowsAcl}; same fail-closed semantics (exec
+   * fails if any path cannot be stamped).
+   *
+   * Pass RAW normalized paths. Do NOT pre-filter or pre-expand
+   * via {@link expandWindowsFsDenyPaths} — `srt-win exec`'s
+   * `canonicalize_deny_targets` is the sole authority for
+   * glob/dir/nonexistent rejection (hard-fail). A missing path
+   * is a caller error, not a skip; pre-filtering would silently
+   * drop it and run the child with the file readable.
+   */
+  denyRead?: readonly string[]
+  /** Per-exec write-deny paths — see {@link denyRead}. */
+  denyWrite?: readonly string[]
+  /**
    * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
    * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
    * `"…"`/`'…'` quotes exactly as written. The security boundary is at
@@ -301,23 +318,45 @@ function runSrtWin(
   }
 }
 
-function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
+// Default: throw on exit≠0 (fail-safe). The one caller that needs
+// the JSON despite a non-zero exit (`acl restore --json`, which
+// prints per-path outcomes and THEN errors when any path stayed
+// stamped) opts in via `allowNonZero: true` and gets the
+// `{ok, json, stderr}` shape. Status callers stay one-liners and
+// cannot regress to silently treating exit≠0 as success.
+function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T
+function runSrtWinJson<T>(
+  args: string[],
+  opts: { timeoutMs?: number; allowNonZero: true },
+): { ok: boolean; json: T; stderr: string }
+function runSrtWinJson<T>(
+  args: string[],
+  opts?: { timeoutMs?: number; allowNonZero?: boolean },
+): T | { ok: boolean; json: T; stderr: string } {
   const r = runSrtWin(args, undefined, opts?.timeoutMs)
+  // Parse stdout BEFORE the exit-code check so `allowNonZero`
+  // can hand back the JSON on exit≠0. JSON.parse never returns
+  // `undefined`, so `json !== undefined` ⇔ parse succeeded.
+  let json: T | undefined
+  let parseErr: string | undefined
+  try {
+    json = JSON.parse(r.stdout) as T
+  } catch (e) {
+    parseErr = (e as Error).message
+  }
+  if (opts?.allowNonZero && json !== undefined) {
+    return { ok: r.status === 0, json, stderr: r.stderr }
+  }
   if (r.status !== 0) {
     throw new Error(
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
     )
   }
-  // Status subcommands print exactly one line of JSON to stdout. stderr
-  // may carry `srt-win:` diagnostics — ignore it for parsing.
-  try {
-    return JSON.parse(r.stdout) as T
-  } catch (e) {
-    throw new Error(
-      `srt-win ${args.join(' ')}: unparseable JSON output ` +
-        `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
-    )
-  }
+  if (json !== undefined) return json
+  throw new Error(
+    `srt-win ${args.join(' ')}: unparseable JSON output ` +
+      `${JSON.stringify(r.stdout)}: ${parseErr}`,
+  )
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -753,11 +792,25 @@ export function restoreWindowsAcl(
     '--json',
   ]
   // Don't let a teardown helper throw — the caller's reset() must
-  // complete. runSrtWinJson covers spawn-fail (ENOENT, AV-lock,
-  // timeout), non-zero exit, and unparseable output with a
-  // descriptive message; log it and return undefined.
+  // complete. runSrtWinJson parses stdout before checking the
+  // exit code, so a non-zero exit with the per-path JSON intact
+  // (`acl restore` prints outcomes THEN errors when any path
+  // stayed stamped) still surfaces every entry to reset()'s loop
+  // instead of collapsing to `undefined`. Only spawn-fail /
+  // unparseable output throws → log and return undefined.
   try {
-    return runSrtWinJson<WindowsAclRestoreResult>(args, { timeoutMs: 60_000 })
+    const r = runSrtWinJson<WindowsAclRestoreResult>(args, {
+      timeoutMs: 60_000,
+      allowNonZero: true,
+    })
+    if (!r.ok) {
+      logForDebugging(
+        `[Sandbox Windows] acl restore exited non-zero (per-path ` +
+          `outcomes preserved): ${r.stderr}`,
+        { level: 'error' },
+      )
+    }
+    return r.json
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
       level: 'error',
@@ -820,6 +873,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (p.holderPid !== undefined) {
     argv.push('--holder-pid', `${p.holderPid}`)
   }
+  for (const f of p.denyRead ?? []) argv.push('--deny-read', f)
+  for (const f of p.denyWrite ?? []) argv.push('--deny-write', f)
   argv.push('--')
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
@@ -866,6 +921,29 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
         p.command,
       )
       break
+  }
+
+  // CreateProcessW's lpCommandLine is capped at 32 767 WCHARs.
+  // Node's `shell:false` spawn builds it by MSVCRT-quoting each
+  // argv element and joining with spaces; the worst-case quote
+  // overhead per element is +2 (wrapping `"`) plus backslash
+  // doubling before embedded quotes (rare in file paths). A
+  // path-count proxy can't see this — 60 long paths overflow
+  // while 200 short ones fit — so estimate the actual command
+  // line and refuse with the same guidance the old count check
+  // gave. ~30 000 leaves headroom for the quote overhead the
+  // estimate doesn't model.
+  const cmdlineEstimate = argv.reduce((n, a) => n + a.length + 3, 0)
+  if (cmdlineEstimate > 30_000) {
+    const nDeny = (p.denyRead?.length ?? 0) + (p.denyWrite?.length ?? 0)
+    throw new Error(
+      `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
+        `(CreateProcessW limit is 32 767). ${nDeny} per-exec ` +
+        `file-deny path(s) ride on this argv — move broad globs to ` +
+        `the session-level filesystem.denyRead/denyWrite (passed to ` +
+        `SandboxManager.initialize(), stdin-passed to \`acl stamp\`) ` +
+        `instead, or shorten the command.`,
+    )
   }
 
   // Drop/overwrite denied credential env vars from the inherited

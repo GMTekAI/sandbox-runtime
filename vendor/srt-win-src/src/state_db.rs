@@ -175,6 +175,11 @@ pub struct StampWitness {
     pub needs_handle_fence: bool,
     /// File was stamped on disk but no row existed (DB wiped).
     pub original_lost: bool,
+    /// `add_holder` inserted a NEW (canon, holder_pid) row. False
+    /// when this holder already held `canon` from a prior batch —
+    /// rollback must NOT `release_one` such a witness or it tears
+    /// down the prior batch's hold.
+    pub holder_added: bool,
     _sealed: (),
 }
 
@@ -601,6 +606,18 @@ pub fn with_init_lock<R>(
     Ok((out, report))
 }
 
+/// Result of a holder's full release pass. Parent restores are a
+/// side-effect of file restores (one parent may serve many files
+/// and is restored once when its last child's refcount drops).
+/// `failed` counts per-path errors swallowed by `release_one`'s
+/// catch-and-continue (logged as WARNING) so the caller can exit
+/// non-zero without aborting mid-batch.
+pub struct RestoreAllOutcomes {
+    pub entries: Vec<(Snapshot, RestoreOutcome)>,
+    pub parent_outs: Vec<(String, ParentRestoreOutcome)>,
+    pub failed: usize,
+}
+
 /// View inside `with_init_lock`. Owns the `Connection`; each method
 /// commits independently (rusqlite autocommits a lone `execute`).
 ///
@@ -628,11 +645,23 @@ impl Locked {
     ///
     /// Fails (no witness, no holder) on `marker_stripped`,
     /// `original_sd_tampered`, or any disk-read error on `canon`.
+    ///
+    /// `refuse_escalation`: when set, escalating the on-disk mask
+    /// (e.g. WriteDeny → ReadDeny) while ANOTHER holder pid holds
+    /// `canon` is a hard error. Per-exec `--deny-*` sets this so a
+    /// short-lived exec cannot leave a session-held file stuck at
+    /// a stricter mask after restore (`release_one` sees
+    /// refcount>0 and never re-stamps). Session-level `acl stamp`
+    /// passes `false` — cross-broker escalation is intentional
+    /// there. The check lives here (post-canonicalize, holders
+    /// table visible) because no string-level guard upstream can
+    /// see canonical identity or concurrent holders.
     pub fn ensure_stamped(
         &mut self,
         canon: &str,
         want_mask: AclMask,
         dacls: &PrebuiltDacls,
+        refuse_escalation: bool,
     ) -> Result<StampWitness> {
         // 1. Disk first.
         let cur = acl::capture_sd(canon)
@@ -711,6 +740,44 @@ impl Locked {
             },
         };
 
+        // 3b. Refuse-escalation gate (see fn doc).
+        //
+        //     Hardlink: NTFS hardlinks share one security
+        //     descriptor across distinct canonical paths, but
+        //     holders/snapshots are PATH-keyed. A per-exec stamp
+        //     under one alias is invisible to a holder of another
+        //     — `release_one` on the alias sees remaining=0 and
+        //     restores the SHARED DACL while the other holder's
+        //     child is still running, regardless of mask. So
+        //     `links != 1` (captured in step 1) is an
+        //     UNCONDITIONAL refuse for per-exec, independent of
+        //     `on_disk_mask`/`eff`. Session-level `acl stamp`
+        //     keeps the existing route-to-handle-fence behaviour
+        //     (step 7) instead.
+        if refuse_escalation && links != 1 {
+            bail!(
+                "per-exec deny refused: '{canon}' has {links} \
+                 hardlink(s); holder rows are path-keyed, so a \
+                 concurrent exec on an alias would prematurely \
+                 restore the shared DACL"
+            );
+        }
+        if refuse_escalation
+            && let Some(m) = on_disk_mask
+            && eff != m
+        {
+            let others = self.other_holders(canon)?;
+            if others > 0 {
+                bail!(
+                    "per-exec deny would escalate '{canon}' from \
+                     {m:?} to {eff:?} while held by {others} other \
+                     broker(s); refusing (the per-exec restore \
+                     cannot de-escalate a still-held file, so the \
+                     stricter mask would persist past this exec)"
+                );
+            }
+        }
+
         // 4. Record-first upsert (fence bit defaults to 1; step 7
         //    reconciles).
         self.upsert_snapshot(
@@ -770,15 +837,28 @@ impl Locked {
                 .context("UPDATE parent_stamp_failed (siblings)")?;
         }
 
-        self.add_holder(canon)?;
+        let holder_added = self.add_holder(canon)?;
         Ok(StampWitness {
             canon: canon.to_string(),
             effective_mask: eff,
             action,
             needs_handle_fence: needs_fence,
             original_lost,
+            holder_added,
             _sealed: (),
         })
+    }
+
+    /// Count holders of `canon` OTHER than `self.holder_pid`.
+    fn other_holders(&self, canon: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM holders \
+                 WHERE canonical_path = ?1 AND pid != ?2",
+                params![canon, self.holder_pid.0 as i64],
+                |r| r.get(0),
+            )
+            .context("count other holders")
     }
 
     /// Converge `parent` to the allow-list + marker. Disk-first;
@@ -951,17 +1031,20 @@ impl Locked {
     }
 
     /// Record the holder against `canonical_path`. Idempotent
-    /// (`INSERT OR IGNORE`). Module-private: a holder row is only
-    /// valid as the last step of [`ensure_stamped`].
-    fn add_holder(&self, canonical_path: &str) -> Result<()> {
-        self.conn
+    /// (`INSERT OR IGNORE`); returns whether a new row was
+    /// inserted (`false` = this holder already held it from a
+    /// prior batch). Module-private: a holder row is only valid
+    /// as the last step of [`ensure_stamped`].
+    fn add_holder(&self, canonical_path: &str) -> Result<bool> {
+        let n = self
+            .conn
             .prepare_cached(
                 "INSERT OR IGNORE INTO holders (canonical_path, pid) \
                  VALUES (?1, ?2)",
             )?
             .execute(params![canonical_path, self.holder_pid.0 as i64])
             .context("INSERT holders")?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Remove the holder from `canonical_path`. Returns `true` if the
@@ -1064,6 +1147,203 @@ impl Locked {
     ) -> Result<RestoreOutcome> {
         try_restore_snapshot(&self.conn, snap, dacls, force, parent_out)
     }
+
+    /// Stamp `targets` under `self.holder_pid`: register this
+    /// holder, then [`Self::ensure_stamped`] each path. Per-path
+    /// errors are logged and collected (the loop continues so
+    /// every failure is reported); on ANY failure the holds added
+    /// **by this call** are rolled back and
+    /// `(witnesses, failed)` is returned — when `failed > 0` the
+    /// witnesses are INFORMATIONAL (for the caller's per-category
+    /// tally) and every newly-added hold has already been
+    /// released. Never `Err` for per-path failures — only the
+    /// up-front `register_broker` propagates — so the caller's
+    /// `with_init_lock` always returns the crash-recovery report.
+    ///
+    /// Rollback is scoped to this batch's NEWLY-ADDED holds
+    /// (`witness.holder_added`), NOT `my_holds()` and NOT every
+    /// witness. The filter is only meaningful for `acl stamp`'s
+    /// re-stamp case (`refuse_escalation=false`): a session host
+    /// may already hold paths from a prior `acl stamp` under the
+    /// SAME holder pid; a failed re-stamp must leave those intact
+    /// (the (canon, pid) row is shared, no per-call refcount —
+    /// dropping the filter would let a second batch that includes
+    /// one bad path tear down the first batch's overlapping deny
+    /// stamps). For per-exec `--deny-*`
+    /// (`refuse_escalation=true`) the holder is the exec
+    /// process's own PID with no prior batch, so every witness
+    /// has `holder_added=true` and the filter is a no-op. After
+    /// rollback, if the holder has no remaining holds the brokers
+    /// row is dropped too — a per-exec stamp failure then leaves
+    /// the DB exactly as it found it (no noisy dead-broker reap
+    /// on the next op).
+    ///
+    /// Shared by `acl stamp` and per-exec `--deny-*` so the two
+    /// cannot diverge in their stamp-or-rollback semantics.
+    pub fn stamp_targets(
+        &mut self,
+        targets: &[(String, AclMask)],
+        dacls: &PrebuiltDacls,
+        refuse_escalation: bool,
+    ) -> Result<(Vec<StampWitness>, usize)> {
+        self.register_broker()?;
+        let mut witnesses = Vec::with_capacity(targets.len());
+        let mut failed = 0usize;
+        for (canon, mask) in targets {
+            // No per-arm policy: every path goes through the same
+            // disk-first chokepoint. The sealed StampWitness makes
+            // a "trust the row, skip the disk check" branch
+            // unspellable.
+            match self
+                .ensure_stamped(canon, *mask, dacls, refuse_escalation)
+            {
+                Ok(w) => witnesses.push(w),
+                Err(e) => {
+                    eprintln!("srt-win: '{canon}': {e:#}");
+                    failed += 1;
+                }
+            }
+        }
+        if failed > 0 {
+            let mut parent_outs = Vec::new();
+            let added: Vec<_> =
+                witnesses.iter().filter(|w| w.holder_added).collect();
+            let release_failed = added
+                .iter()
+                .filter(|w| matches!(
+                    self.release_one(&w.canon, dacls, &mut parent_outs),
+                    ReleaseOutcome::Failed,
+                ))
+                .count();
+            // The "{N} of {M} could not be stamped; rolled back"
+            // line is the CALLER's to print (with `acl stamp` vs
+            // per-exec context). This block only surfaces what
+            // the caller cannot see: a rollback that did not
+            // fully undo (release_one is catch-and-continue).
+            if release_failed > 0 {
+                eprintln!(
+                    "srt-win: WARNING: rollback could not undo \
+                     {release_failed} of this batch's {} \
+                     newly-added hold(s); those file(s) stay \
+                     stamped (fail-closed) until `acl recover`",
+                    added.len(),
+                );
+            }
+            if self.my_holds().map(|h| h.is_empty()).unwrap_or(false) {
+                let _ = self.unregister_broker();
+            }
+            // Witnesses returned for the caller's per-category
+            // tally ("9 newly stamped, …, 1 FAILED — rolled
+            // back"); when `failed > 0` they are INFORMATIONAL
+            // ONLY — every newly-added hold has already been
+            // released above.
+            return Ok((witnesses, failed));
+        }
+        Ok((witnesses, 0))
+    }
+
+    /// Release one hold of `self.holder_pid` on `canon`; if the
+    /// refcount drops to zero, restore via [`Self::try_restore`].
+    /// Per-path catch-and-continue: every failure is logged and
+    /// fail-closed (file stays stamped); never returns `Err`.
+    ///
+    /// The single per-path release body — [`Self::restore_all`]
+    /// loops it over `my_holds()`, [`Self::stamp_targets`]'s
+    /// rollback loops it over this batch's witnesses. Callers
+    /// count `Failed` themselves (no out-param plumbing).
+    fn release_one(
+        &self,
+        canon: &str,
+        dacls: &PrebuiltDacls,
+        parent_outs: &mut Vec<(String, ParentRestoreOutcome)>,
+    ) -> ReleaseOutcome {
+        let now_zero = match self.remove_holder(canon) {
+            Ok(z) => z,
+            Err(e) => {
+                eprintln!(
+                    "srt-win: WARNING: remove_holder '{canon}': \
+                     {e:#}; leaving stamped (fail-closed)"
+                );
+                return ReleaseOutcome::Failed;
+            }
+        };
+        if !now_zero {
+            // Another holder still has it — released our claim,
+            // file stays stamped. Not reported (the LAST holder
+            // to release does).
+            return ReleaseOutcome::StillHeld;
+        }
+        let snap = match self.get_snapshot(canon) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Holder row already removed; with no snapshot
+                // there is nothing to restore and nothing for
+                // crash-recovery to reap. Warn-only — counting
+                // this as `Failed` would make callers promise a
+                // later reap that cannot happen.
+                eprintln!(
+                    "srt-win: WARNING: '{canon}' had a holder row \
+                     but no snapshot — nothing to restore"
+                );
+                return ReleaseOutcome::NoSnapshot;
+            }
+            Err(e) => {
+                eprintln!(
+                    "srt-win: WARNING: get_snapshot '{canon}': \
+                     {e:#}; leaving stamped (fail-closed)"
+                );
+                return ReleaseOutcome::Failed;
+            }
+        };
+        match self.try_restore(&snap, dacls, false, parent_outs) {
+            Ok(out) => ReleaseOutcome::Restored(snap, out),
+            Err(e) => {
+                eprintln!(
+                    "srt-win: WARNING: restore '{}': {e:#}; \
+                     leaving stamped (fail-closed)",
+                    snap.canonical_path
+                );
+                ReleaseOutcome::Failed
+            }
+        }
+    }
+
+    /// Release every hold of `self.holder_pid` (via
+    /// [`Self::release_one`] over `my_holds()`) and unregister the
+    /// broker. Per-path catch-and-continue. Only the up-front
+    /// `my_holds` / final `unregister_broker` errors propagate.
+    ///
+    /// Shared by `acl restore` and per-exec `--deny-*` teardown.
+    pub fn restore_all(
+        &self,
+        dacls: &PrebuiltDacls,
+    ) -> Result<RestoreAllOutcomes> {
+        let holds = self.my_holds()?;
+        let mut entries = Vec::new();
+        let mut parent_outs = Vec::new();
+        let mut failed = 0usize;
+        for canon in &holds {
+            match self.release_one(canon, dacls, &mut parent_outs) {
+                ReleaseOutcome::Restored(s, o) => entries.push((s, o)),
+                ReleaseOutcome::Failed => failed += 1,
+                ReleaseOutcome::StillHeld
+                | ReleaseOutcome::NoSnapshot => {}
+            }
+        }
+        self.unregister_broker()?;
+        Ok(RestoreAllOutcomes { entries, parent_outs, failed })
+    }
+}
+
+/// Per-path result of [`Locked::release_one`]. `Failed` means the
+/// file was left stamped (fail-closed) and a WARNING was logged;
+/// callers count it. `NoSnapshot` is warn-only (holder row already
+/// removed, nothing left to reap).
+enum ReleaseOutcome {
+    Restored(Snapshot, RestoreOutcome),
+    StillHeld,
+    NoSnapshot,
+    Failed,
 }
 
 const SNAPSHOT_SELECT_BY_PATH: &str =
