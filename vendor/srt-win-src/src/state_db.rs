@@ -135,6 +135,18 @@ CREATE TABLE IF NOT EXISTS parent_stamps (
 CREATE INDEX IF NOT EXISTS holders_by_pid ON holders (pid);
 CREATE INDEX IF NOT EXISTS snapshots_by_parent
   ON acl_snapshots (parent_path);
+-- Install-time setup record: the sandbox user's DPAPI-encrypted
+-- credential plus the setup marker. One row per provisioned
+-- sandbox user (currently exactly one). Additive table — no
+-- schema-version bump.
+CREATE TABLE IF NOT EXISTS sandbox_user (
+  username        TEXT    PRIMARY KEY,
+  user_sid        TEXT    NOT NULL,
+  group_sid       TEXT    NOT NULL,
+  cred            BLOB    NOT NULL,
+  marker_version  INTEGER NOT NULL,
+  created_at_unix INTEGER NOT NULL
+);
 "#;
 
 /// One stored restore record. No `mask`/`stamped_sd` — both are
@@ -331,7 +343,7 @@ impl InitMutex {
 
 /// Open (creating if needed) the state DB at the default location.
 /// Stamps the parent directory broker-only on EVERY open.
-fn open_db(group_sid: &str) -> Result<Connection> {
+pub fn open_db(group_sid: &str) -> Result<Connection> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create_dir_all {}", dir.display()))?;
@@ -499,7 +511,7 @@ fn query_vec<T, P: rusqlite::Params>(
 /// `None` if `state.db` doesn't exist yet. No mutex, no
 /// `create_dir_all`, no dir-stamp, no schema apply — for `srt-win
 /// exec`'s holder-paths read on the per-Bash-call hot path.
-fn open_db_ro() -> Result<Option<Connection>> {
+pub fn open_db_ro() -> Result<Option<Connection>> {
     let path = state_dir()?.join("state.db");
     match path.try_exists() {
         Ok(false) => return Ok(None),
@@ -589,6 +601,92 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA_SQL).context("apply schema")?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(conn)
+}
+
+/// One row of the `sandbox_user` table — the install-time setup
+/// record: the sandbox user's DPAPI-encrypted credential plus the
+/// setup marker. Written by `srt-win install`, read by the
+/// non-elevated broker.
+#[derive(Debug, Clone)]
+pub struct SetupInfo {
+    pub sandbox_user: String,
+    pub sandbox_user_sid: String,
+    pub sandbox_group_sid: String,
+    /// DPAPI ciphertext of the sandbox user's password.
+    pub cred: Vec<u8>,
+    pub marker_version: u32,
+    pub created_at_unix: u64,
+}
+
+/// Write the setup record. Single-row `INSERT OR REPLACE`, so a
+/// crash mid-install never leaves a partial marker. Install is
+/// sequential under self-elevation, so the caller doesn't need
+/// [`with_init_lock`].
+pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sandbox_user \
+         (username, user_sid, group_sid, cred, marker_version, \
+          created_at_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            info.sandbox_user,
+            info.sandbox_user_sid,
+            info.sandbox_group_sid,
+            info.cred,
+            info.marker_version,
+            info.created_at_unix as i64,
+        ],
+    )
+    .context("INSERT sandbox_user")?;
+    Ok(())
+}
+
+/// Hydrate the setup record. `Ok(None)` when no install has run
+/// (no row, or the `sandbox_user` table itself absent —
+/// [`open_db_ro`] doesn't apply schema). Currently exactly one
+/// sandbox user is provisioned, so this reads the single row.
+pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
+    match conn
+        .query_row(
+            "SELECT username, user_sid, group_sid, cred, \
+                    marker_version, created_at_unix \
+             FROM sandbox_user LIMIT 1",
+            [],
+            |r| {
+                Ok(SetupInfo {
+                    sandbox_user: r.get(0)?,
+                    sandbox_user_sid: r.get(1)?,
+                    sandbox_group_sid: r.get(2)?,
+                    cred: r.get(3)?,
+                    marker_version: r.get(4)?,
+                    created_at_unix: r.get::<_, i64>(5)? as u64,
+                })
+            },
+        )
+        .optional()
+    {
+        Ok(v) => Ok(v),
+        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
+        Err(e) => Err(anyhow!("SELECT sandbox_user: {e}")),
+    }
+}
+
+/// `DELETE FROM sandbox_user` — uninstall clears the credential
+/// and marker in one go.
+pub fn clear_setup_info(conn: &Connection) -> Result<()> {
+    match conn.execute("DELETE FROM sandbox_user", []) {
+        Ok(_) => Ok(()),
+        Err(e) if missing_sandbox_user_table(&e) => Ok(()),
+        Err(e) => Err(anyhow!("clear_setup_info: {e}")),
+    }
+}
+
+fn missing_sandbox_user_table(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(m))
+            if m.contains("no such table") && m.contains("sandbox_user")
+    )
 }
 
 /// `%LOCALAPPDATA%\sandbox-runtime`. Errors if `LOCALAPPDATA` is
