@@ -21,6 +21,7 @@ import {
   getSrtWinPath,
   getWindowsGroupStatus,
   getWindowsWfpStatus,
+  getWindowsSandboxUserStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
   deleteWindowsGroup,
@@ -398,6 +399,18 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.group.sid).toMatch(/^S-1-5-/)
       expect(r.wfp.state).toBe('installed')
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
+      // Sandbox user provisioned alongside the group + WFP.
+      expect(r.user.provisioned).toBe(true)
+      expect(r.user.sid).toMatch(/^S-1-5-21-/)
+      expect(r.user.groupExists).toBe(true)
+      expect(r.user.inBuiltinUsers).toBe(true)
+      expect(r.user.inSandboxGroup).toBe(true)
+      expect(r.user.credPresent).toBe(true)
+      expect(r.user.markerVersion).toBe(1)
+      // user-SID-keyed filter set present alongside the group set,
+      // tagged with the provisioned SID.
+      expect(r.wfp.userFilters).toBeGreaterThanOrEqual(4)
+      expect(r.wfp.userSid).toBe(r.user.sid)
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
         groupName: grp,
@@ -412,9 +425,15 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(u.cancelled).toBeUndefined()
       deleteWindowsGroup({ groupName: grp })
     }
-    // After uninstall+delete, both gone.
+    // After uninstall+delete, all three gone (group, WFP, sandbox
+    // user). Discriminator group needed explicit delete; sandbox
+    // user is removed by uninstall (no --keep-user).
     expect(getWindowsWfpStatus({ sublayerGuid: sl }).state).toBe('absent')
     expect(getWindowsGroupStatus({ groupName: grp }).state).toBe('absent')
+    const u = getWindowsSandboxUserStatus()
+    expect(u.provisioned).toBe(false)
+    expect(u.credPresent).toBe(false)
+    expect(u.markerVersion).toBeUndefined()
   })
 
   it('installWindowsSandbox refuses different-config without force (exit 13)', () => {

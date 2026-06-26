@@ -46,6 +46,14 @@ if ($env:SRT_ALT_GUID) {
 & $Exe wfp uninstall --sublayer-guid 9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e
 & $Exe group delete --name $GroupName
 & $Exe group delete --name "$GroupName-inst"
+# Sandbox user + credential/marker rows in state.db — `srt-win
+# install` provisions these; `uninstall` (no --keep-user) removes
+# them, so this only matters if smoke.ps1 threw mid-section.
+& $Exe uninstall --sublayer-guid $InstallSublayer
+Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
+Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
+Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
+  -Name srt-sandbox -ea SilentlyContinue
 # Restore any leaked ACL stamps (smoke-acl.ps1 mid-failure) and
 # clear orphaned snapshot rows. --force overwrites third-party
 # DACL edits — fine on an ephemeral runner.

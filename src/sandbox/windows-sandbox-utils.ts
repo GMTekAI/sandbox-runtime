@@ -76,6 +76,45 @@ export interface WindowsWfpStatusResult {
   filters: number
   /** `[low, high]` from the `permit-loopback` filter's tag, when present. */
   portRange?: [number, number]
+  /**
+   * Number of user-SID-keyed filters present (subset of `filters`).
+   * Zero on installs that predate the sandbox-user provisioning
+   * step, or when only `wfp install` (group set) was run.
+   */
+  userFilters: number
+  /** Sandbox-user SID read from the first user-keyed filter tag. */
+  userSid?: string
+}
+
+/**
+ * State of the `srt-sandbox` local account that `srt-win install`
+ * provisions. The sandboxed child eventually runs **as** this
+ * account; for now it is reported alongside the group/WFP status
+ * so callers can surface a "re-run install" diagnostic when the
+ * account is missing.
+ */
+export interface WindowsSandboxUserStatus {
+  /** The `srt-sandbox` local account exists. */
+  provisioned: boolean
+  /** `S-1-5-21-…` of `srt-sandbox`, when provisioned. */
+  sid?: string
+  /** The `sandbox-runtime-users` local group exists. */
+  groupExists: boolean
+  /** `S-1-5-21-…` of `sandbox-runtime-users`, when it exists. */
+  groupSid?: string
+  inBuiltinUsers: boolean
+  inSandboxGroup: boolean
+  hiddenFromLogon: boolean
+  /**
+   * The credential row is present in `state.db` and readable by
+   * THIS process. False when not yet written, or when called from
+   * inside the sandbox (the state-DB directory carries an explicit
+   * DENY for `sandbox-runtime-users` — machine-scope DPAPI alone
+   * is not a confidentiality boundary).
+   */
+  credPresent: boolean
+  /** Setup marker schema version, when the marker row exists. */
+  markerVersion?: number
 }
 
 /**
@@ -391,11 +430,50 @@ export function getWindowsWfpStatus(
     state: WindowsWfpStatus
     filters: number
     port_range?: [number, number]
+    user_filters?: number
+    user_sid?: string
   }>(args)
   return {
     state: raw.state,
     filters: raw.filters,
     ...(raw.port_range && { portRange: raw.port_range }),
+    userFilters: raw.user_filters ?? 0,
+    ...(raw.user_sid && { userSid: raw.user_sid }),
+  }
+}
+
+/**
+ * Query the sandbox user account's provisioning state. Each field
+ * is independently observed so a half-provisioned install (e.g.
+ * user exists but credential file missing) is distinguishable.
+ * Does not require elevation.
+ */
+export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
+  const raw = runSrtWinJson<{
+    user: {
+      exists: boolean
+      sid?: string
+      group_exists: boolean
+      group_sid?: string
+      in_builtin_users: boolean
+      in_sandbox_group: boolean
+      hidden_from_logon: boolean
+    }
+    cred_present: boolean
+    marker_version?: number | null
+  }>(['user', 'status'])
+  return {
+    provisioned: raw.user.exists,
+    ...(raw.user.sid && { sid: raw.user.sid }),
+    groupExists: raw.user.group_exists,
+    ...(raw.user.group_sid && { groupSid: raw.user.group_sid }),
+    inBuiltinUsers: raw.user.in_builtin_users,
+    inSandboxGroup: raw.user.in_sandbox_group,
+    hiddenFromLogon: raw.user.hidden_from_logon,
+    credPresent: raw.cred_present,
+    ...(typeof raw.marker_version === 'number' && {
+      markerVersion: raw.marker_version,
+    }),
   }
 }
 
@@ -424,6 +502,8 @@ export interface WindowsInstallResult {
   group: WindowsGroupStatusResult
   /** Post-install WFP state. */
   wfp: WindowsWfpStatusResult
+  /** Post-install sandbox-user state. */
+  user: WindowsSandboxUserStatus
   /**
    * `true` if the user dismissed the UAC prompt. Not an error —
    * the install simply didn't happen. Re-run when the user is
@@ -479,6 +559,7 @@ export function installWindowsSandbox(
   //   11 group create failed
   //   12 WFP install failed
   //   13 already installed with different config (use --force)
+  //   14 sandbox-user provisioning failed
   //   1  other error (stderr has detail)
   const out = r.stderr || r.stdout
   switch (r.status) {
@@ -488,12 +569,17 @@ export function installWindowsSandbox(
       return {
         group: getWindowsGroupStatus(opts),
         wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
+        user: getWindowsSandboxUserStatus(),
         cancelled: true,
       }
     case 11:
       throw new Error(`srt-win install: group create failed: ${out}`)
     case 12:
       throw new Error(`srt-win install: WFP filter install failed: ${out}`)
+    case 14:
+      throw new Error(
+        `srt-win install: sandbox user provisioning failed: ${out}`,
+      )
     case 13:
       throw new Error(
         `srt-win install: filters already exist under this sublayer with ` +
@@ -508,6 +594,7 @@ export function installWindowsSandbox(
   return {
     group: getWindowsGroupStatus(opts),
     wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
+    user: getWindowsSandboxUserStatus(),
   }
 }
 
@@ -520,13 +607,21 @@ export function installWindowsSandbox(
  * re-do the logout dance on the next install. Call
  * {@link deleteWindowsGroup} explicitly if you want full teardown.
  *
+ * **Does** remove the `srt-sandbox` account, its credential file,
+ * and the setup marker, unless `keepUser` is set — the credential
+ * is useless without the account and vice versa, so they're
+ * treated as one unit.
+ *
  * @returns `{cancelled: true}` if the user dismissed UAC.
  */
-export function uninstallWindowsSandbox(opts: { sublayerGuid?: string } = {}): {
+export function uninstallWindowsSandbox(
+  opts: { sublayerGuid?: string; keepUser?: boolean } = {},
+): {
   cancelled?: true
 } {
   const args = ['uninstall']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
+  if (opts.keepUser) args.push('--keep-user')
   const r = runSrtWin(args)
   logForDebugging(
     `[Sandbox Windows] uninstall exit=${r.status}: ${r.stderr || r.stdout}`,

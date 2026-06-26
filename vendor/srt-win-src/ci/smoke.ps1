@@ -242,6 +242,79 @@ if ($iw.state -ne 'installed' -or $iw.filters -lt 8) {
   throw "install: wfp expected installed/>=8, got $($iw.state)/$($iw.filters)"
 }
 
+# ── sandbox user provisioned by install ────────────────────────────
+$us = J @('user', 'status')
+Write-Host "user status: $($us | ConvertTo-Json -Compress)"
+if (-not $us.user.exists)            { throw "install: sandbox user not provisioned" }
+if (-not $us.user.sid -or -not $us.user.sid.StartsWith('S-1-5-21-')) {
+  throw "install: sandbox user SID missing or malformed: '$($us.user.sid)'"
+}
+if (-not $us.user.group_exists)      { throw "install: sandbox-runtime-users group missing" }
+if (-not $us.user.in_builtin_users)  { throw "install: sandbox user not in BUILTIN\Users" }
+if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandbox-runtime-users" }
+if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
+if (-not $us.cred_present)           { throw "install: credential not present in state DB" }
+if ($us.marker_version -ne 1)        { throw "install: setup marker version expected 1, got $($us.marker_version)" }
+if ($us.marker_user_sid -ne $us.user.sid) {
+  throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
+}
+
+# user-SID-keyed WFP filters present alongside the group set, with
+# the right SID in their tag.
+if ($iw.user_filters -lt 4) {
+  throw "install: expected >=4 user-SID filters, got $($iw.user_filters)"
+}
+if ($iw.user_sid -ne $us.user.sid) {
+  throw "install: WFP user_sid '$($iw.user_sid)' != provisioned '$($us.user.sid)'"
+}
+
+# read-cred returns the cleartext password — 32 chars from the
+# documented alphabet. Run as the real user (the sandbox user is
+# DENY'd on the directory; that side is verified once the runner
+# exists).
+$pw = & $Exe user read-cred
+if ($LASTEXITCODE -ne 0) { throw "user read-cred exited $LASTEXITCODE" }
+if ($pw.Length -ne 32)   { throw "user read-cred: expected 32 chars, got $($pw.Length)" }
+if ($pw -match '["\s\\`&|<>^]') {
+  throw "user read-cred: password contains an excluded char: '$pw'"
+}
+
+# State-dir DACL: explicit DENY for sandbox-runtime-users. This is
+# the load-bearing gate on the credential file (machine-scope DPAPI
+# is not a confidentiality boundary — any local account can decrypt
+# a readable blob). The broker-only PROTECTED allow set already
+# excludes the sandbox user, but the explicit DENY makes the intent
+# auditable.
+$stateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime'
+$acl = Get-Acl $stateDir
+$deny = $acl.Access | Where-Object {
+  $_.AccessControlType -eq 'Deny' -and
+  $_.IdentityReference.Value -match 'sandbox-runtime-users$'
+}
+if (-not $deny) {
+  throw "install: state-dir DACL has no DENY for sandbox-runtime-users; got:`n$($acl.Access | Out-String)"
+}
+if (-not (Test-Path (Join-Path $stateDir 'state.db'))) {
+  throw "install: state.db missing at $stateDir"
+}
+
+# block-user must NOT match the REAL user — its SD allows only the
+# sandbox user's SID. (The sandbox-side "is blocked" assertion needs
+# the runner; deferred.)
+$r = curl.exe -s -m 10 -o NUL -w "%{http_code}" https://example.com
+if ($LASTEXITCODE -ne 0 -or $r -ne '200') {
+  throw "install: real-user egress past block-user expected 200, got exit=$LASTEXITCODE code='$r'"
+}
+Write-Host "install: real-user egress past block-user OK ($r)"
+
+# `wfp install` (group set only) must NOT drop the user-SID set —
+# the two sets are independent.
+Run (@('wfp', 'install', '--name', $instGrp) + $isl + $pr)
+$iwAfter = J (@('wfp', 'status') + $isl)
+if ($iwAfter.user_filters -ne $iw.user_filters) {
+  throw "wfp install perturbed user-SID filters: $($iw.user_filters) -> $($iwAfter.user_filters)"
+}
+
 # Idempotency, same range: second install with identical flags is
 # a no-op (exit 0, "already installed").
 $out = & $Exe @(@('install', '--name', $instGrp) + $isl + $pr) 2>&1 | Out-String
@@ -288,15 +361,42 @@ if ($LASTEXITCODE -ne 11) {
   throw "install: invalid --group-sid expected exit 11, got $LASTEXITCODE"
 }
 
-# Uninstall removes filters only — group remains.
+# --keep-user: filters removed, sandbox user + cred file kept.
+Run (@('uninstall', '--keep-user') + $isl)
+$uw0 = J (@('wfp', 'status') + $isl)
+if ($uw0.state -ne 'absent' -or $uw0.user_filters -ne 0) {
+  throw "uninstall --keep-user: wfp expected absent/0, got $($uw0.state)/$($uw0.user_filters)"
+}
+$us0 = J @('user', 'status')
+if (-not $us0.user.exists -or -not $us0.cred_present) {
+  throw "uninstall --keep-user: sandbox user/cred should be kept"
+}
+# Re-install to set up for the full uninstall below.
+Run (@('install', '--name', $instGrp) + $isl + $pr)
+
+# Uninstall removes filters AND the sandbox user — discriminator
+# group remains.
 Run (@('uninstall') + $isl)
 $uw = J (@('wfp', 'status') + $isl)
 if ($uw.state -ne 'absent') {
   throw "uninstall: wfp expected absent, got $($uw.state)"
 }
+if ($uw.user_filters -ne 0) {
+  throw "uninstall: user-SID filters expected 0, got $($uw.user_filters)"
+}
 $ug = J @('group', 'status', '--name', $instGrp)
 if ($ug.state -notin 'created-not-on-token', 'ready') {
   throw "uninstall: group should be left intact, got $($ug.state)"
+}
+$usGone = J @('user', 'status')
+if ($usGone.user.exists) {
+  throw "uninstall: sandbox user should be removed, got $($usGone | ConvertTo-Json -Compress)"
+}
+if ($usGone.cred_present) {
+  throw "uninstall: credential row should be cleared"
+}
+if ($null -ne $usGone.marker_version) {
+  throw "uninstall: setup marker row should be cleared"
 }
 # Idempotent no-op: second uninstall must also exit 0.
 Run (@('uninstall') + $isl)

@@ -49,6 +49,7 @@ export {
   getSrtWinPath,
   getWindowsGroupStatus,
   getWindowsWfpStatus,
+  getWindowsSandboxUserStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
   createWindowsGroup,
@@ -76,6 +77,7 @@ export type {
   WindowsAclPathOutcome,
   WindowsAclParentOutcome,
   WindowsWfpStatusResult,
+  WindowsSandboxUserStatus,
 } from './sandbox/windows-sandbox-utils.js'
 export type { WindowsConfig } from './sandbox/sandbox-config.js'
 export { WindowsConfigSchema } from './sandbox/sandbox-config.js'
