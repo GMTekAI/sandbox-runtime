@@ -17,6 +17,7 @@ import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsGroupStatus,
@@ -1335,4 +1336,341 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     ).rejects.toThrow(/allowWrite is not supported on Windows/)
     await SandboxManager.reset()
   })
+})
+
+// ────────────────────────────────────────────────────────────────────
+// Group G — tlsTerminate CA trust via env vars
+// ────────────────────────────────────────────────────────────────────
+//
+// The TLS-terminating proxy itself is platform-agnostic (covered by
+// tls-terminate-proxy.test.ts, which the Windows CI leg also runs);
+// these rows prove the sandboxed CHILD trusts the proxy-minted certs
+// via the env vars `generateProxyEnvVars` emits when `caCertPath` is
+// set. Trust is env-only on Windows — no certificate-store install.
+//
+// Tool/row selection follows per-tool ground-truth probes run on
+// win-x64 and win-arm64. In particular: Schannel
+// `curl.exe` (System32, and the ARM64 git-bundled clangarm64 build)
+// ignores `CURL_CA_BUNDLE`, so the curl row gates on an OpenSSL
+// build being present; git defaults to the schannel backend (which
+// ignores `GIT_SSL_CAINFO`), so the git row forces
+// `http.sslBackend=openssl`; cargo's vendored Schannel libcurl
+// honors `CARGO_HTTP_CAINFO` but hard-fails revocation against a
+// CRL-less private CA, so it pairs with `CARGO_HTTP_CHECK_REVOKE=
+// false`. Schannel/.NET/WinHTTP and Go-built tools read the Windows
+// store only and are NOT covered by env-var trust — pinned in G8.
+
+// Committed test-only CA — see test/fixtures/tls-terminate/README.md.
+const TLS_FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
+const CA_CERT = join(TLS_FIXTURE_DIR, 'ca.crt')
+const CA_KEY = join(TLS_FIXTURE_DIR, 'ca.key')
+
+/**
+ * Locate an OpenSSL-backend curl. On x64 git-for-windows ships
+ * `mingw64\bin\curl.exe` (typically OpenSSL); on ARM64 the bundled
+ * curl is `clangarm64\bin\curl.exe` and is Schannel — so this
+ * returns `undefined` there and the G3 row skips. Probed via
+ * `curl --version` since the build flavour, not the path, decides.
+ */
+function findOpenSslCurl(): string | undefined {
+  if (!isWindows) return undefined
+  for (const c of [
+    'C:\\Program Files\\Git\\mingw64\\bin\\curl.exe',
+    'C:\\Program Files\\Git\\clangarm64\\bin\\curl.exe',
+    'C:\\msys64\\mingw64\\bin\\curl.exe',
+  ]) {
+    if (!existsSync(c)) continue
+    const r = spawnSync(c, ['--version'], { encoding: 'utf8', timeout: 5_000 })
+    if (r.status === 0 && /OpenSSL/i.test(r.stdout)) return c
+  }
+  return undefined
+}
+const OPENSSL_CURL = findOpenSslCurl()
+
+/** True if `python -c "import <mod>"` succeeds. */
+function hasPythonModule(mod: string): boolean {
+  if (!isWindows || !hasTool('python')) return false
+  const r = spawnSync('python', ['-c', `import ${mod}`], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  })
+  return r.status === 0
+}
+
+function createTlsTestConfig(allowedDomains: string[]): SandboxRuntimeConfig {
+  const base = createTestConfig(allowedDomains)
+  return {
+    ...base,
+    network: {
+      ...base.network,
+      tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+    },
+  }
+}
+
+// G1/G1b — env-injection layer (pure, all platforms). Mirrors
+// tls-terminate-trust-env.test.ts at the same assertion depth, but
+// against the Windows wrapper's `{argv, env}` shape instead of a
+// shell string. SRT_WIN_PATH is pointed at any existing file so
+// getSrtWinPath() doesn't throw on non-Windows hosts.
+describe('wrapCommandWithSandboxWindows tlsTerminate trust env (pure, all platforms)', () => {
+  function wrap(caCertPath?: string): NodeJS.ProcessEnv {
+    const prevSrtWin = process.env.SRT_WIN_PATH
+    process.env.SRT_WIN_PATH = process.execPath
+    try {
+      return wrapCommandWithSandboxWindows({
+        command: 'echo',
+        group: { groupSid: ADMINS_SID },
+        httpProxyPort: 60080,
+        socksProxyPort: 60080,
+        caCertPath,
+      }).env
+    } finally {
+      if (prevSrtWin === undefined) delete process.env.SRT_WIN_PATH
+      else process.env.SRT_WIN_PATH = prevSrtWin
+    }
+  }
+
+  it('G1: env carries every CA_TRUST_VARS entry, forward-slashed', () => {
+    // Probe with backslashes; the wrapper must normalise.
+    const winPath = 'C:\\srt\\trust-bundle.crt'
+    const env = wrap(winPath)
+    const want = 'C:/srt/trust-bundle.crt'
+    for (const v of CA_TRUST_VARS) {
+      expect(env[v]).toBe(want)
+    }
+    // Forward-slash means no backslash survives anywhere in the value.
+    expect(env.SSL_CERT_FILE).not.toContain('\\')
+  })
+
+  it('G1b: env does not override CA_TRUST_VARS when caCertPath unset', () => {
+    // The returned env inherits process.env, so the var may exist
+    // (some CI runners pre-set NODE_EXTRA_CA_CERTS). What we assert
+    // is that the wrapper did not ADD it — value equals whatever
+    // the host already had.
+    const env = wrap(undefined)
+    for (const v of CA_TRUST_VARS) {
+      expect(env[v]).toBe(process.env[v])
+    }
+  })
+})
+
+describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
+  // Allowed domains for the live tool rows. Each tool's row resets
+  // the allowlist via updateConfig (live-swap; the proxy reads it
+  // per-request) so this superset just bounds initialize().
+  const TLS_ALLOWED = [
+    'example.com',
+    'github.com',
+    'crates.io',
+    'static.crates.io',
+    'index.crates.io',
+  ]
+
+  beforeAll(async () => {
+    console.error('[winsrt G beforeAll] start')
+    // Reuse the network/file-deny describes' WFP install (already
+    // present in CI from the earlier suites; install when running
+    // this describe in isolation).
+    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        groupSid: ADMINS_SID,
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+      })
+    }
+    await SandboxManager.initialize(createTlsTestConfig(TLS_ALLOWED))
+    // Sanity: tlsTerminate config produced a CA + trust bundle.
+    const ca = SandboxManager.getMitmCA()
+    expect(ca?.trustBundlePath).toBeTruthy()
+    console.error('[winsrt G beforeAll] done')
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  it('G2: child sees SSL_CERT_FILE and can read the trust bundle', async () => {
+    // Mirrors tls-terminate-trust-env.test.ts row 3. The path is
+    // emitted with forward slashes (so it survives msys2 and is
+    // accepted by every CreateFileW caller); cmd's `type` BUILTIN
+    // does its own path parsing and rejects `/`, so flip them back
+    // to `\` via cmd's `%VAR:/=\%` substitution for this one
+    // builtin. writeTrustBundle puts the CA first, then system
+    // roots — assert the path landed and the PEM header is present.
+    const r = await runSandboxed(
+      `echo %SSL_CERT_FILE% && type "%SSL_CERT_FILE:/=\\%"`,
+    )
+    expectStatus('G2', r, [0])
+    const bundle = SandboxManager.getMitmCA()!.trustBundlePath.replace(
+      /\\/g,
+      '/',
+    )
+    const out = r.stdout.replace(/\r/g, '')
+    const firstLine = out.split('\n')[0].trim()
+    expect(firstLine).toBe(bundle)
+    expect(out).toContain('-----BEGIN CERTIFICATE-----')
+  })
+
+  it.skipIf(OPENSSL_CURL === undefined)(
+    'G3: OpenSSL curl trusts the MITM CA via CURL_CA_BUNDLE',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      // -v so stderr carries `issuer:` for the MITM-proof assertion;
+      // -sS so transfer noise is suppressed but errors still print.
+      const r = await runSandboxedUntil(
+        `"${OPENSSL_CURL}" -sS -v -o NUL https://example.com/`,
+        x => x.status === 0,
+      )
+      expectStatus('G3', r, [0])
+      // The leaf is minted by our CA — issuer CN is the fixture's.
+      expect(r.stderr).toMatch(/issuer:.*srt-test-ca/i)
+    },
+    60_000,
+  )
+
+  it.skipIf(!hasTool('git'))(
+    'G4: git (-c http.sslBackend=openssl) trusts the MITM CA via GIT_SSL_CAINFO',
+    async () => {
+      SandboxManager.updateConfig(
+        createTlsTestConfig(['example.com', 'github.com']),
+      )
+      // git's default backend on Windows is schannel, which IGNORES
+      // GIT_SSL_CAINFO unless `http.schannelUseSSLCAInfo=true`; the
+      // openssl backend honors it directly. git-via-proxy is heavier
+      // than curl (smart-HTTP), so 45s/attempt + 120s overall.
+      const r = await runSandboxedUntil(
+        'git -c http.sslBackend=openssl ls-remote https://github.com/git/git.git HEAD',
+        x => x.status === 0 && /HEAD/.test(x.stdout),
+        2,
+        45_000,
+      )
+      expectStatus('G4', r, [0])
+      expect(r.stdout).toMatch(/HEAD/)
+    },
+    120_000,
+  )
+
+  it.skipIf(!hasTool('node'))(
+    'G5: node trusts the MITM CA via NODE_EXTRA_CA_CERTS (extends)',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      // Node's built-in `fetch` (undici) does NOT honor proxy env
+      // vars, so a bare fetch goes direct and the WFP fence blocks
+      // it (the B5 row pins exactly this). To prove
+      // NODE_EXTRA_CA_CERTS is honored we tunnel explicitly:
+      // http CONNECT to the proxy (read from `HTTPS_PROXY`,
+      // including the auth token), then `https.get` over the
+      // resulting socket. `https.get` validates the proxy-minted
+      // cert against the system roots + NODE_EXTRA_CA_CERTS, so a
+      // missing/unreadable bundle surfaces as
+      // UNABLE_TO_VERIFY_LEAF_SIGNATURE on the inner request.
+      // NODE_EXTRA_CA_CERTS failures are a one-time startup
+      // warning, NOT a hard error — assert the MITM'd request
+      // returns 200, not just that node ran.
+      const bundle = SandboxManager.getMitmCA()!.trustBundlePath
+      const script = [
+        `const u=new URL(process.env.HTTPS_PROXY);`,
+        `const auth='Basic '+Buffer.from(u.username+':'+u.password).toString('base64');`,
+        `require('http').request({host:u.hostname,port:u.port,method:'CONNECT',path:'example.com:443',headers:{'Proxy-Authorization':auth}})`,
+        `.on('connect',(res,sock)=>{`,
+        ` if(res.statusCode!==200){console.error('CONNECT:'+res.statusCode);process.exit(3)}`,
+        ` require('https').get({host:'example.com',path:'/',socket:sock,agent:false},`,
+        `  r=>{console.log('STATUS:'+r.statusCode);process.exit(r.statusCode===200?0:1)})`,
+        ` .on('error',e=>{console.error('TLS:'+(e.code||e.message));process.exit(2)})`,
+        `}).on('error',e=>{console.error('CONN:'+(e.code||e.message));process.exit(3)}).end()`,
+      ].join('')
+      const r = await runSandboxedUntil(
+        `node -e "${script}"`,
+        x => x.status === 0,
+      )
+      expectStatus(`G5 (bundle=${bundle} exists=${existsSync(bundle)})`, r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it.skipIf(!hasPythonModule('requests'))(
+    'G6: python requests trusts the MITM CA via REQUESTS_CA_BUNDLE',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `python -c "import requests; print('STATUS:'+str(requests.get('https://example.com/').status_code))"`,
+        x => x.status === 0,
+      )
+      expectStatus('G6', r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it.skipIf(!hasTool('python'))(
+    'G7: python stdlib trusts the MITM CA via SSL_CERT_FILE',
+    async () => {
+      // On Windows `SSL_CERT_FILE` is ADDITIVE for cpython
+      // (load_default_certs also loads the Windows store), unlike
+      // on POSIX where it replaces. Either way the MITM'd request
+      // verifies against our CA.
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `python -c "import urllib.request as u; print('STATUS:'+str(u.urlopen('https://example.com/').status))"`,
+        x => x.status === 0,
+      )
+      expectStatus('G7', r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it('G8: System32 curl (Schannel) does NOT honor CURL_CA_BUNDLE — known limitation', async () => {
+    // Schannel curl ignores CURL_CA_BUNDLE/SSL_CERT_FILE by design
+    // — only `--cacert` is read (and it then hard-fails revocation
+    // against a CRL-less private CA). This row pins the limitation
+    // and fails loudly if a future Windows curl starts honouring
+    // the env var (at which point the README limitation lifts).
+    // BLOCK-shape: single-shot, never retried — assert exit ≠ 0
+    // since the precise schannel error code varies.
+    SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+    const sysCurl = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
+    const r = await runSandboxed(`"${sysCurl}" -sS -o NUL https://example.com/`)
+    if (r.status === 0) {
+      throw new Error(
+        `G8: System32 curl unexpectedly succeeded — Schannel curl ` +
+          `now honours CURL_CA_BUNDLE? Update the known-limitations ` +
+          `note. stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    // SEC_E_UNTRUSTED_ROOT or a revocation error — either is the
+    // expected schannel rejection.
+    expect(r.stderr).toMatch(/schannel|SEC_E_|revocation/i)
+  }, 30_000)
+
+  it.skipIf(!hasTool('cargo'))(
+    'G9: cargo trusts the MITM CA via CARGO_HTTP_CAINFO',
+    async () => {
+      // cargo's vendored libcurl is Schannel but honors `CAINFO`
+      // (replace semantics). Like the tool/cargo row, schannel's
+      // CRL fetch goes through CryptoAPI/WinHTTP (no proxy env), so
+      // CARGO_HTTP_CHECK_REVOKE=false is required against a CRL-less
+      // private CA.
+      SandboxManager.updateConfig(
+        createTlsTestConfig([
+          'crates.io',
+          'static.crates.io',
+          'index.crates.io',
+        ]),
+      )
+      const r = await runSandboxedUntil(
+        'cargo search serde --limit 1',
+        x => x.status === 0 && /serde/.test(x.stdout),
+        2,
+        30_000,
+        { CARGO_HTTP_CHECK_REVOKE: 'false' },
+      )
+      expectStatus('G9', r, [0])
+      expect(r.stdout).toMatch(/serde/)
+    },
+    120_000,
+  )
 })
