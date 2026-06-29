@@ -1,6 +1,8 @@
 import * as fs from 'node:fs'
+import * as net from 'node:net'
 import * as path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import {
@@ -69,7 +71,7 @@ export interface WindowsGroupStatusResult {
   error?: string
 }
 
-export type WindowsWfpStatus = 'absent' | 'installed'
+export type WindowsWfpStatus = 'absent' | 'installed' | 'cannot-read'
 
 export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
@@ -84,6 +86,23 @@ export interface WindowsWfpStatusResult {
   userFilters: number
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
+  /**
+   * Populated only on `cannot-read` (BFE enumeration is admin-gated;
+   * a non-elevated caller can't read it). The non-elevated readiness
+   * check is {@link verifyWindowsWfpEgress}, not this enum.
+   */
+  hint?: string
+}
+
+/**
+ * Result of `srt-win wfp verify` on success (exit 0, `blocked`) —
+ * see {@link verifyWindowsWfpEgress}. Any other outcome throws, so
+ * the tri-state is unobservable on the return path.
+ */
+export interface WindowsWfpVerifyResult {
+  target: string
+  /** Runner's stderr (carries the `BLOCKED (…)` diagnostic line). */
+  stderr: string
 }
 
 /**
@@ -197,14 +216,6 @@ export function parseWindowsBinShell(raw?: string): WindowsBinShell {
 export interface WindowsSandboxParams {
   command: string
   group: WindowsGroupRef
-  /**
-   * Sublayer GUID under which the WFP filters were installed.
-   * `srt-win exec` checks `wfp status` against it and refuses to
-   * launch when no filter set is present (fail-closed network
-   * fence). When omitted, srt-win uses its compile-time default
-   * GUID — same as `srt-win install` with no `--sublayer-guid`.
-   */
-  sublayerGuid?: string
   /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the returned env. */
   httpProxyPort?: number
   /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the returned env. */
@@ -455,10 +466,15 @@ export function getWindowsGroupStatus(
 }
 
 /**
- * Query the WFP filter set under the given sublayer. `installed` means
- * srt-win-tagged `permit-group` AND `block` filters are both present
- * under that sublayer. Detection is **tag-based** (providerData JSON);
- * filters installed by other tooling without the tag are not counted.
+ * Query the WFP filter set under the given sublayer via live BFE
+ * enumeration. `installed` means srt-win-tagged `permit-group` AND
+ * `block` filters are both present under that sublayer. Detection is
+ * **tag-based** (providerData JSON); filters installed by other
+ * tooling without the tag are not counted.
+ *
+ * BFE enumeration is admin-gated — a non-elevated caller gets
+ * `state:"cannot-read"` with a `hint` (not an error). The
+ * non-elevated readiness check is {@link verifyWindowsWfpEgress}.
  */
 export function getWindowsWfpStatus(
   opts: { sublayerGuid?: string } = {},
@@ -471,6 +487,7 @@ export function getWindowsWfpStatus(
     port_range?: [number, number]
     user_filters?: number
     user_sid?: string
+    hint?: string
   }>(args)
   return {
     state: raw.state,
@@ -478,6 +495,109 @@ export function getWindowsWfpStatus(
     ...(raw.port_range && { portRange: raw.port_range }),
     userFilters: raw.user_filters ?? 0,
     ...(raw.user_sid && { userSid: raw.user_sid }),
+    ...(raw.hint && { hint: raw.hint }),
+  }
+}
+
+/**
+ * Behavioral proof that the WFP egress fence is active for the
+ * sandbox user. Binds a local listener on an ephemeral loopback port
+ * outside the WFP loopback-permit range, then spawns `srt-win
+ * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
+ * attempt a direct TCP connect to it. The WFP block-user filter
+ * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
+ * active fence yields WSAEACCES immediately and a missing fence lets
+ * the connect through (the kernel completes the handshake against
+ * the listening socket's backlog; no event-loop tick required, so
+ * the synchronous `runSrtWin` is safe). Does not require elevation
+ * and does not depend on any external host.
+ *
+ * `initialize()` calls this once per session when
+ * `windows.asSandboxUser` is set, so a stale install (sandbox user
+ * provisioned but filters since removed) fails closed at session
+ * start instead of running every exec with full egress.
+ *
+ * @param opts.target overrides the probe target (skips the local
+ *   listener bind).
+ * @param opts.proxyPortRange the WFP loopback-permit range the
+ *   listener must avoid. Default
+ *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
+ * @throws on any outcome other than `blocked` (exit 0).
+ */
+export async function verifyWindowsWfpEgress(
+  opts: {
+    target?: string
+    proxyPortRange?: readonly [number, number]
+  } = {},
+): Promise<WindowsWfpVerifyResult> {
+  let target = opts.target
+  let server: net.Server | undefined
+  if (!target) {
+    // Bind ephemeral; retry if it lands inside the WFP
+    // loopback-permit range (a port in-range would be PERMITted
+    // even with the fence active → false `connected`).
+    const [lo, hi] = opts.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+    for (let i = 0; i < 5; i++) {
+      const s = net.createServer()
+      s.listen(0, '127.0.0.1')
+      await once(s, 'listening')
+      const p = (s.address() as net.AddressInfo).port
+      if (p < lo || p > hi) {
+        server = s
+        target = `127.0.0.1:${p}`
+        break
+      }
+      s.close()
+    }
+    if (!target) {
+      throw new Error(
+        `verifyWindowsWfpEgress: could not bind a loopback ` +
+          `listener outside the WFP permit range [${lo},${hi}] in ` +
+          `5 attempts`,
+      )
+    }
+  }
+  try {
+    // 30s: first call after install may create the sandbox user's
+    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
+    // same budget as windowsTrustCa, plus the runner's own 2s
+    // connect timeout.
+    const r = runSrtWin(
+      ['wfp', 'verify', '--target', target],
+      undefined,
+      30_000,
+    )
+    logForDebugging(
+      `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
+    )
+    let raw: { egress_probe: string; target: string }
+    try {
+      raw = JSON.parse(r.stdout)
+    } catch {
+      throw new Error(
+        `WFP egress fence could not be verified — \`srt-win wfp ` +
+          `verify\` exited ${r.status} with unparseable output ` +
+          `${JSON.stringify(r.stdout)}: ${r.stderr}`,
+      )
+    }
+    if (r.status === 3) {
+      throw new Error(
+        `WFP egress fence is not active — direct outbound from the ` +
+          `sandbox user to ${raw.target} succeeded. Re-run ` +
+          `\`srt-win install\` (one UAC prompt). (${r.stderr})`,
+      )
+    }
+    if (r.status !== 0) {
+      throw new Error(
+        `WFP egress fence could not be verified — probe to ` +
+          `${raw.target} was '${raw.egress_probe}' (exit ` +
+          `${r.status}). The fence may be absent. Re-run \`srt-win ` +
+          `install\`. (${r.stderr})`,
+      )
+    }
+    return { target: raw.target, stderr: r.stderr }
+  } finally {
+    server?.close()
   }
 }
 
@@ -1090,12 +1210,6 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   delete generated.TMPDIR
 
   const argv: string[] = [exe, 'exec', ...groupRefArgs(p.group)]
-  // Format-validated at the config boundary
-  // (`WindowsConfigSchema.wfpSublayerGuid: z.string().uuid()`),
-  // and again by clap's GUID parser at the binary boundary; the
-  // outer spawn is `shell:false`, so the value is an argv element,
-  // never shell-interpolated.
-  if (p.sublayerGuid) argv.push('--sublayer-guid', p.sublayerGuid)
   if (p.holderPid !== undefined) {
     argv.push('--holder-pid', `${p.holderPid}`)
   }
@@ -1301,7 +1415,10 @@ export function checkWindowsDependencies(
   }
   if (gs.warning) warnings.push(gs.warning)
 
-  // 3. WFP filters installed under the sublayer.
+  // 3. WFP filters installed under the sublayer. BFE enumeration is
+  // admin-gated; `cannot-read` is informational only — the
+  // BEHAVIORAL check (`verifyWindowsWfpEgress`) runs at
+  // `initialize()` and is what actually fails closed.
   let ws: WindowsWfpStatusResult
   try {
     ws = getWindowsWfpStatus({ sublayerGuid })
@@ -1309,7 +1426,11 @@ export function checkWindowsDependencies(
     errors.push(`srt-win wfp status failed: ${(e as Error).message}`)
     return { errors, warnings }
   }
-  if (ws.state !== 'installed') {
+  if (ws.state === 'cannot-read') {
+    logForDebugging(
+      `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
+    )
+  } else if (ws.state !== 'installed') {
     // If the group is also not-ready, the group-state error above
     // already gave the right instruction; don't repeat. Only
     // surface a separate WFP error when group IS ready (i.e.

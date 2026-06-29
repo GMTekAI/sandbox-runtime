@@ -128,10 +128,11 @@ pub fn trust_ca(
     der: &crate::cert_store::CertDer,
     cred: &SandboxCred,
 ) -> Result<()> {
-    let bytes =
-        runner::encode_cmd(&runner::RunnerCmd::InstallCa { der: der.clone() })?;
-    let code = logon::spawn_runner(&cred.user, &cred.pw, None, &bytes)
-        .context("spawn runner for CA install")?;
+    let code = logon::spawn_runner(
+        &cred.user, &cred.pw, None,
+        &runner::RunnerCmd::InstallCa { der: der.clone() },
+    )
+    .context("spawn runner for CA install")?;
     if code != 0 {
         return Err(anyhow!(
             "CA install runner exited {code} — the registry write \

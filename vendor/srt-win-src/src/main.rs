@@ -138,14 +138,6 @@ enum Cmd {
     Exec {
         #[command(flatten)]
         group: GroupRef,
-        /// Sublayer GUID under which the WFP filters were
-        /// installed. Default is the compile-time constant (same
-        /// as `srt-win install`). exec refuses to launch when no
-        /// srt-win filter set is installed under this sublayer —
-        /// the network fence is the load-bearing isolation
-        /// boundary; without it the child has full egress.
-        #[arg(long)]
-        sublayer_guid: Option<String>,
         /// Skip the "is the group enabled in the broker's token"
         /// pre-flight. **Fail-open** — the WFP fence depends on
         /// that membership; with this set the child may run with
@@ -156,14 +148,6 @@ enum Cmd {
         /// and cannot logout/login mid-run.
         #[arg(long)]
         skip_group_check: bool,
-        /// Skip the WFP filter-presence pre-flight. **Fail-open**
-        /// — without filters the child has unrestricted network
-        /// egress. Same intentional-bypass semantics as
-        /// `--skip-group-check`. Use ONLY when the network fence
-        /// is provided by another mechanism (or is not required
-        /// for the test).
-        #[arg(long)]
-        skip_wfp_check: bool,
         /// PID of the long-lived host whose `acl stamp` holds this
         /// child should be fenced under. When set, exec opens a
         /// no-`FILE_SHARE_DELETE` handle on every file that holder
@@ -694,11 +678,38 @@ enum WfpCmd {
         proxy_port_range: Option<String>,
     },
     /// Print WFP fence state as JSON: `{state, filters,
-    /// port_range?}`. Filters are identified by their
-    /// `providerData` tag, so only `--sublayer-guid` is relevant.
+    /// port_range?, hint?}`. Live BFE enumeration only — admin-gated
+    /// by BFE; a non-elevated caller gets `state:"cannot-read"`
+    /// (exit 0) with a hint pointing at `wfp verify`. Filters are
+    /// identified by their `providerData` tag, so only
+    /// `--sublayer-guid` is relevant.
     Status {
         #[arg(long)]
         sublayer_guid: Option<String>,
+    },
+    /// Behavioral egress-block probe: spawn the runner as the
+    /// sandbox user and attempt a direct TCP connect to
+    /// `--target`. The WFP block-user filter fires at
+    /// `ALE_AUTH_CONNECT` — before any packet leaves — so an
+    /// active fence yields WSAEACCES immediately.
+    /// Prints `{"egress_probe":"blocked"|"connected"|"unreachable",
+    /// "target":…}` and exits **0** (blocked = fence active),
+    /// **3** (connected = fence MISSING), **2** (unreachable =
+    /// timeout/no-route; treat as failure), or **15** when the
+    /// sandbox user is not provisioned. Any other code (including
+    /// 1, the runner's own anyhow `Err` path) maps to
+    /// `egress_probe:"error"`. Does not require elevation. This
+    /// is the non-elevated readiness check the host's
+    /// `initialize()` runs; `wfp status` is the elevated
+    /// ground-truth enum.
+    Verify {
+        /// Probe target (`host:port`). The host binds a local
+        /// listener on an ephemeral loopback port OUTSIDE the WFP
+        /// loopback-permit range and passes it here, so the
+        /// fence-inactive case is deterministic without depending
+        /// on any external host.
+        #[arg(long)]
+        target: String,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -1091,6 +1102,51 @@ fn run() -> anyhow::Result<()> {
             let st = wfp::filter_status(&sl)?;
             println!("{}", serde_json::to_string(&st)?);
         }
+        Cmd::Wfp { sub: WfpCmd::Verify { target } } => {
+            use srt_win::{install, logon, runner};
+            // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
+            // packet leaves, so an active fence gives WSAEACCES
+            // (~0ms, exit 0); a MISSING fence lets the connect
+            // succeed (exit 3). The host passes a local loopback
+            // listener bound outside the WFP permit range so
+            // fence-missing is distinguishable from fence-active
+            // without depending on any external host.
+            let cred = match install::read_cred() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("srt-win: error: wfp verify: {e:#}");
+                    std::process::exit(15);
+                }
+            };
+            let code = logon::spawn_runner(
+                &cred.user, &cred.pw, None,
+                &runner::RunnerCmd::ProbeEgress { target: target.clone() },
+            )
+            .context("spawn runner for egress probe")?;
+            let probe = match code {
+                0 => "blocked",
+                3 => "connected",
+                2 => "unreachable",
+                // 1 is the runner's own anyhow `Err` path
+                // (`main()` → `eprintln!` + `exit(1)`); anything
+                // else is an unmapped runner state. Neither is a
+                // valid probe outcome.
+                _ => "error",
+            };
+            println!(
+                "{}",
+                json!({
+                    "egress_probe": probe,
+                    "target": target,
+                    "runner_exit": code,
+                })
+            );
+            // `process::exit`'s rt::cleanup flushes stdout, but be
+            // explicit — this is the only arm that prints to stdout
+            // and then `process::exit`s instead of returning Ok(()).
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(code as i32);
+        }
         Cmd::Wfp { sub: WfpCmd::Uninstall { sublayer_guid } } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
@@ -1308,9 +1364,7 @@ fn run() -> anyhow::Result<()> {
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             group,
-            sublayer_guid,
             skip_group_check,
-            skip_wfp_check,
             holder_pid,
             deny_read,
             deny_write,
@@ -1320,49 +1374,14 @@ fn run() -> anyhow::Result<()> {
         } => {
             use srt_win::{acl, launch, state_db};
             let gsid = resolve_group_sid(&group)?;
-            // WFP pre-flight (mirrors the group-state pre-flight in
-            // launch::run_lockdown). The TS host already gates on
-            // `getWindowsWfpStatus().state == 'installed'`, but
-            // `srt-win exec` invoked directly would otherwise
-            // fail-open with no network fence at all. Done here
-            // (not in launch.rs) so resolve_sublayer's GUID-parse
-            // error reporting is shared with `wfp status|install`.
-            let sl = resolve_sublayer(&sublayer_guid)?;
-            match wfp::filter_status(&sl) {
-                Ok(s) if s.state == "installed" => {}
-                Ok(s) if skip_wfp_check => {
-                    eprintln!(
-                        "srt-win: WARNING: --skip-wfp-check is set and \
-                         WFP filters under sublayer {sl:?} are \
-                         {} ({} filter(s)). The network fence is NOT \
-                         in effect for this process tree.",
-                        s.state, s.filters,
-                    );
-                }
-                Ok(s) => {
-                    return Err(anyhow!(
-                        "WFP filters under sublayer {sl:?} are {} \
-                         ({} filter(s)) — the network fence is not \
-                         installed. Run `srt-win install` (or `srt-win \
-                         wfp install --sublayer-guid {sl:?}`). Pass \
-                         --skip-wfp-check to bypass.",
-                        s.state, s.filters,
-                    ));
-                }
-                Err(e) if skip_wfp_check => {
-                    eprintln!(
-                        "srt-win: WARNING: --skip-wfp-check is set and \
-                         WFP filter status could not be read ({e:#}); \
-                         proceeding without verifying the network fence"
-                    );
-                }
-                Err(e) => {
-                    return Err(anyhow!(
-                        "cannot verify WFP filter state under sublayer \
-                         {sl:?}: {e:#}. Pass --skip-wfp-check to bypass."
-                    ));
-                }
-            }
+            // No WFP pre-flight here: BFE enumeration is
+            // admin-gated, so a non-elevated broker can't read it.
+            // The fence is verified BEHAVIORALLY by `srt-win wfp
+            // verify` at the host's `initialize()` (it spawns the
+            // runner as the sandbox user and expects WSAEACCES on a
+            // direct connect). Standalone `srt-win exec` callers
+            // should run `srt-win wfp verify` once per session.
+            //
             // `target` is `required, num_args=1..` so non-empty.
             let exe = std::path::PathBuf::from(&target[0]);
             let args = &target[1..];
@@ -1546,17 +1565,15 @@ fn run() -> anyhow::Result<()> {
                     cred.user,
                     env_overlay.len(),
                 );
-                let bytes = runner::encode_cmd(&runner::RunnerCmd::Exec(
-                    runner::RunnerSpec {
-                        argv: target.clone(),
-                        env_overlay,
-                    },
-                ))?;
                 let cwd = std::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(String::from));
                 logon::spawn_runner(
-                    &cred.user, &cred.pw, cwd.as_deref(), &bytes,
+                    &cred.user, &cred.pw, cwd.as_deref(),
+                    &runner::RunnerCmd::Exec(runner::RunnerSpec {
+                        argv: target.clone(),
+                        env_overlay,
+                    }),
                 )?
                 // `cred` drops here → `SandboxCred::Drop` zeroes the
                 // password.

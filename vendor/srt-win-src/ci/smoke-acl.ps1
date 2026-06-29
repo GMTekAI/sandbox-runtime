@@ -99,11 +99,11 @@ function RunJson {
 # Exec helper.
 function ChildExec {
   param([string[]] $tail)
-  # --skip-wfp-check: this script does NOT install WFP filters
-  # (the network fence is orthogonal to the FS-deny tests; exec
-  # is used here only to obtain a deny-only-group token). The
-  # WFP pre-flight would otherwise refuse every ChildExec.
-  $argv = @('exec', '--group-sid', $GroupSid, '--skip-wfp-check') + $tail
+  # This script does NOT install WFP filters — the network fence is
+  # orthogonal to the FS-deny tests; exec is used here only to
+  # obtain a deny-only-group token. exec has no WFP pre-flight
+  # (BFE enum is admin-gated; the host runs `wfp verify` instead).
+  $argv = @('exec', '--group-sid', $GroupSid) + $tail
   $raw = & $Exe @argv 2>&1 | Out-String
   $exit = $LASTEXITCODE
   $lines = $raw -split "`r?`n"
@@ -1244,7 +1244,7 @@ try {
   $f29 = Join-Path $Scratch 'a29.txt'
   Set-Content -Path $f29 -Value 'A29-DATA' -NoNewline
   $exec29 = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden `
-    -ArgumentList @('exec', '--group-sid', $GroupSid, '--skip-wfp-check',
+    -ArgumentList @('exec', '--group-sid', $GroupSid,
                     '--deny-read', $f29, '--', $cmd, '/d', '/s', '/c',
                     'ping -n 60 127.0.0.1 >nul')
   try {

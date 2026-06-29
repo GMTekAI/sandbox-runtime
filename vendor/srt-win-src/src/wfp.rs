@@ -112,8 +112,38 @@ const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x80320003;
 const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x80320007;
 const FWP_E_IN_USE: u32 = 0x8032000A;
+// `FwpmEngineOpen0` / `FwpmFilterCreateEnumHandle0` are admin-gated
+// by BFE; non-elevated callers get one of these.
+const FWP_E_ACCESS_DENIED: u32 = 0x8032_0028;
+const ERROR_ACCESS_DENIED: u32 = 5;
 
 use crate::util::OwnedSd;
+
+/// Typed marker for an admin-gated BFE call returning access-denied.
+/// `FwpmFilterCreateEnumHandle0` (and on some configurations
+/// `FwpmEngineOpen0`) require elevation; a non-elevated `wfp status`
+/// hits this. [`filter_status`] downcasts and degrades to
+/// `state:"cannot-read"`; the host's behavioral check is `wfp
+/// verify`, not the enum.
+#[derive(Debug)]
+pub struct WfpAccessDenied {
+    pub call: &'static str,
+    pub rc: u32,
+}
+impl std::fmt::Display for WfpAccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: 0x{:08x} (BFE filter enumeration is admin-only)",
+            self.call, self.rc
+        )
+    }
+}
+impl std::error::Error for WfpAccessDenied {}
+
+fn is_bfe_access_denied(rc: u32) -> bool {
+    rc == ERROR_ACCESS_DENIED || rc == FWP_E_ACCESS_DENIED
+}
 
 // ────────────────────── small RAII helpers ──────────────────────
 
@@ -134,6 +164,12 @@ impl EngineHandle {
             FwpmEngineOpen0(PCWSTR::null(), 0xFFFF_FFFF, None, None, &mut h)
         };
         if rc != 0 {
+            if is_bfe_access_denied(rc) {
+                return Err(anyhow::Error::new(WfpAccessDenied {
+                    call: "FwpmEngineOpen0",
+                    rc,
+                }));
+            }
             return Err(anyhow!("FwpmEngineOpen0 failed: 0x{rc:08x}"));
         }
         Ok(Self(h))
@@ -400,6 +436,12 @@ fn for_each_tagged_filter(
             FwpmFilterCreateEnumHandle0(engine.h(), Some(&tmpl), &mut h)
         };
         if rc != 0 {
+            if is_bfe_access_denied(rc) {
+                return Err(anyhow::Error::new(WfpAccessDenied {
+                    call: "FwpmFilterCreateEnumHandle0",
+                    rc,
+                }));
+            }
             return Err(anyhow!(
                 "FwpmFilterCreateEnumHandle0({layer_name}): 0x{rc:08x}"
             ));
@@ -907,6 +949,12 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
 /// `port_range` is read from the first `permit-loopback` tag;
 /// `None` when no loopback filter is present or it predates the
 /// port-range design.
+///
+/// `cannot-read` is the graceful-degrade state when BFE
+/// enumeration is admin-gated ([`WfpAccessDenied`]). The
+/// non-elevated readiness check is `srt-win wfp verify` (a
+/// behavioral probe — spawns the runner as the sandbox user and
+/// expects WSAEACCES on a direct connect), not this enum.
 #[derive(Debug, Serialize)]
 pub struct WfpStatus {
     pub state: &'static str,
@@ -921,17 +969,31 @@ pub struct WfpStatus {
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
+    /// Populated only on `cannot-read`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
+/// Live BFE enumeration. Admin-gated — a non-elevated caller gets
+/// `state:"cannot-read"` (not an error) so `wfp status` exits 0
+/// with a hint pointing at `wfp verify`. Elevated callers
+/// (`install`'s early-return, the smoke scripts) get the real
+/// per-filter counts.
 pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
-    let engine = EngineHandle::open()?;
+    let engine = match EngineHandle::open() {
+        Ok(e) => e,
+        Err(e) if e.downcast_ref::<WfpAccessDenied>().is_some() => {
+            return Ok(cannot_read(e));
+        }
+        Err(e) => return Err(e),
+    };
     let mut filters = 0usize;
     let mut user_filters = 0usize;
     let mut have_permit_group = false;
     let mut have_block = false;
     let mut port_range: Option<[u16; 2]> = None;
     let mut user_sid: Option<String> = None;
-    for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
+    let enum_result = for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
         filters += 1;
         if tag.user_sid.is_some() {
             user_filters += 1;
@@ -954,13 +1016,36 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
             }
             _ => {}
         }
-    })?;
+    });
+    if let Err(e) = enum_result {
+        if e.downcast_ref::<WfpAccessDenied>().is_some() {
+            return Ok(cannot_read(e));
+        }
+        return Err(e);
+    }
     let state = if have_permit_group && have_block {
         "installed"
     } else {
         "absent"
     };
-    Ok(WfpStatus { state, filters, port_range, user_filters, user_sid })
+    Ok(WfpStatus {
+        state, filters, port_range, user_filters, user_sid,
+        hint: None,
+    })
+}
+
+fn cannot_read(e: anyhow::Error) -> WfpStatus {
+    WfpStatus {
+        state: "cannot-read",
+        filters: 0,
+        port_range: None,
+        user_filters: 0,
+        user_sid: None,
+        hint: Some(format!(
+            "{e}; elevation required for filter enum — run `srt-win \
+             wfp verify` for a behavioral check"
+        )),
+    }
 }
 
 /// Parse a `--proxy-port-range LOW-HIGH` argument. Both ends are

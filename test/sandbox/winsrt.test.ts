@@ -24,6 +24,7 @@ import {
   getWindowsSandboxUserStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
+  verifyWindowsWfpEgress,
   deleteWindowsGroup,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
@@ -339,27 +340,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
   })
 
-  it('wrapCommandWithSandboxWindows: sublayerGuid lands on the exec argv', () => {
-    const sl = '11111111-2222-3333-4444-555555555555'
-    const { argv } = wrapCommandWithSandboxWindows({
-      command: 'exit 0',
-      group: { groupSid: ADMINS_SID },
-      sublayerGuid: sl,
-    })
-    // `srt-win exec` refuses to launch when no WFP filter set is
-    // installed under this sublayer (fail-closed network fence).
-    const i = argv.indexOf('--sublayer-guid')
-    expect(i).toBeGreaterThan(0)
-    expect(argv[i + 1]).toBe(sl)
-    expect(i).toBeLessThan(argv.indexOf('--'))
-    // Omitted → no flag (srt-win checks its compile-time default).
-    const { argv: noSl } = wrapCommandWithSandboxWindows({
-      command: 'exit 0',
-      group: { groupSid: ADMINS_SID },
-    })
-    expect(noSl).not.toContain('--sublayer-guid')
-  })
-
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
     const ws = getWindowsWfpStatus({
       sublayerGuid: '11111111-2222-3333-4444-555555555555',
@@ -377,6 +357,40 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     )
     await SandboxManager.reset()
   })
+
+  // The non-elevated readiness check that initialize() runs.
+  // Hermetic sublayer + full-uninstall in finally so the
+  // round-trips test below starts from an unprovisioned state.
+  it('verifyWindowsWfpEgress: blocked after install; throws after uninstall --keep-user', async () => {
+    const sl = '6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60'
+    installWindowsSandbox({
+      groupSid: ADMINS_SID,
+      sublayerGuid: sl,
+      proxyPortRange: PORT_RANGE,
+    })
+    try {
+      // Fence active: WFP block-user filter fires at
+      // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
+      // probe binds a local out-of-range loopback listener; no
+      // external host involved.
+      const v = await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+      expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
+      // Filters removed, sandbox user kept → fence inactive →
+      // throws. This is the throw initialize() relays when a stale
+      // install (user provisioned, filters since removed) would
+      // otherwise run every exec with full egress. The regex
+      // matches both the exit-3 (`is not active`) and exit-2
+      // (`could not be verified`) messages — either is correct
+      // fail-closed behaviour.
+      uninstallWindowsSandbox({ sublayerGuid: sl, keepUser: true })
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(
+        verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE }),
+      ).rejects.toThrow(/WFP egress fence/i)
+    } finally {
+      uninstallWindowsSandbox({ sublayerGuid: sl })
+    }
+  }, 60_000)
 
   it('installWindowsSandbox round-trips group + wfp under a fresh sublayer', () => {
     // Use a unique group name + sublayer so this test is hermetic.
@@ -1663,7 +1677,6 @@ describe.if(isWindows && asSandboxUserEnabled)(
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: tail,
         group: { groupSid: ADMINS_SID },
-        sublayerGuid: TEST_SUBLAYER,
         asSandboxUser: true,
       })
       return spawnAsync(argv[0], argv.slice(1), {

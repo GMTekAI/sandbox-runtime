@@ -44,6 +44,8 @@ if ($env:SRT_ALT_GUID) {
 # delete it here — harmless leftover state on an ephemeral runner.
 & $Exe wfp uninstall --sublayer-guid 8d2f1e91-4b3c-5a6e-af9d-2e3f4a5b6c7d
 & $Exe wfp uninstall --sublayer-guid 9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e
+# winsrt.test.ts verifyWindowsWfpEgress row.
+& $Exe wfp uninstall --sublayer-guid 6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60
 & $Exe group delete --name $GroupName
 & $Exe group delete --name "$GroupName-inst"
 # Sandbox user + credential/marker rows in state.db — `srt-win

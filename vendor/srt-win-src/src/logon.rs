@@ -111,16 +111,16 @@ fn pump(src: HANDLE, dst: HANDLE) {
     }
 }
 
-/// Spawn `srt-win runner` as `username` and return its exit code.
-/// `cmd_bytes` is the wire-encoded [`crate::runner::RunnerCmd`]
-/// (length-prefix + JSON). `cwd` is set as the runner's working
+/// Spawn `srt-win runner` as `username`, send `cmd` over stdin, and
+/// return its exit code. `cwd` is set as the runner's working
 /// directory; `None` inherits the broker's.
 pub fn spawn_runner(
     username: &str,
     password: &str,
     cwd: Option<&str>,
-    cmd_bytes: &[u8],
+    cmd: &crate::runner::RunnerCmd,
 ) -> Result<u32> {
+    let cmd_bytes = crate::runner::encode_cmd(cmd)?;
     let stdin = make_pipe(false)?;
     let stdout = make_pipe(true)?;
     let stderr = make_pipe(true)?;
@@ -264,7 +264,7 @@ pub fn spawn_runner(
         unsafe {
             WriteFile(
                 stdin.broker.raw(),
-                Some(cmd_bytes),
+                Some(&cmd_bytes),
                 Some(&mut wrote),
                 None,
             )

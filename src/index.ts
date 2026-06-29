@@ -49,6 +49,7 @@ export {
   getSrtWinPath,
   getWindowsGroupStatus,
   getWindowsWfpStatus,
+  verifyWindowsWfpEgress,
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
   windowsTrustCa,
@@ -79,6 +80,7 @@ export type {
   WindowsAclPathOutcome,
   WindowsAclParentOutcome,
   WindowsWfpStatusResult,
+  WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
 } from './sandbox/windows-sandbox-utils.js'
 export type { WindowsConfig } from './sandbox/sandbox-config.js'

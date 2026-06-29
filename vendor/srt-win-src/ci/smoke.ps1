@@ -361,12 +361,47 @@ if ($LASTEXITCODE -ne 11) {
   throw "install: invalid --group-sid expected exit 11, got $LASTEXITCODE"
 }
 
-# `user trust-ca` routes through CreateProcessWithLogonW
-# (Secondary Logon). GHA runners have it; ensure it's running
-# (idempotent).
+# `wfp verify` and `user trust-ca` route through
+# CreateProcessWithLogonW (Secondary Logon). GHA runners have it;
+# ensure it's running (idempotent).
 try { Start-Service seclogon -ea Stop } catch {
   Write-Host "smoke: WARNING: Start-Service seclogon: $_"
 }
+
+# ── wfp verify: behavioral egress-block probe ───────────────────────
+# Spawns the runner as the sandbox user and direct-connects to a
+# target. The block-user filter fires at ALE_AUTH_CONNECT (before
+# any packet leaves) → WSAEACCES → exit 0 + "blocked". This is the
+# non-elevated readiness check (BFE enum is admin-gated; this
+# isn't). stderr (the runner's BLOCKED/UNREACHABLE line) flows to
+# the host so it's in the CI log; stdout is JUST the JSON line.
+#
+# `--target 127.0.0.1:49999` (a local listener bound below) — OUT of
+# the WFP loopback permit range, so block-user fires when the fence
+# is active and the connect succeeds when it isn't. Deterministic;
+# no internet. This is the same shape as the product path
+# (`verifyWindowsWfpEgress` binds an ephemeral out-of-range loopback
+# listener and passes it as `--target`).
+$probePort = 49999
+$probeTgt = "127.0.0.1:$probePort"
+$probeLsn = [System.Net.Sockets.TcpListener]::new(
+  [System.Net.IPAddress]::Loopback, $probePort)
+$probeLsn.Start()
+function WfpVerify([string]$tgt) {
+  $out = & $Exe wfp verify --target $tgt
+  $ec = $LASTEXITCODE
+  Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
+}
+$v = WfpVerify $probeTgt
+if ($v.exit -ne 0 -or $v.json.egress_probe -ne 'blocked') {
+  throw ("wfp verify (fence-active): expected exit 0 + blocked, " +
+         "got exit=$($v.exit) probe='$($v.json.egress_probe)'")
+}
+if ($v.json.target -ne $probeTgt) {
+  throw "wfp verify: --target not honoured; got '$($v.json.target)'"
+}
+Write-Host "wfp verify ok: fence-active → blocked (target=$probeTgt)"
 
 # ── user trust-ca: cert recorded + written ─────────────────────────
 # Cert lifecycle = sandbox-user lifecycle (set via `user trust-ca`,
@@ -443,6 +478,23 @@ $us0 = J @('user', 'status')
 if (-not $us0.user.exists -or -not $us0.cred_present) {
   throw "uninstall --keep-user: sandbox user/cred should be kept"
 }
+
+# ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
+# Filters were just removed (`uninstall --keep-user`) but the
+# sandbox user is kept → the probe runs and the connect to the
+# local listener SUCCEEDS (no WFP block) → exit 3 + "connected".
+# This is the security-boundary proof that exit 0 above wasn't a
+# false positive.
+$v = WfpVerify $probeTgt
+if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
+  throw ("wfp verify (fence-inactive): expected exit 3 + " +
+         "connected, got exit=$($v.exit) probe=" +
+         "'$($v.json.egress_probe)' — probe cannot distinguish " +
+         "fence-active from fence-missing")
+}
+Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
+$probeLsn.Stop()
+
 # Re-install to set up for the full uninstall below.
 Run (@('install', '--name', $instGrp) + $isl + $pr)
 
