@@ -21,11 +21,17 @@
  * `mode: "deny"` (see macos-sandbox-utils.ts).
  */
 
+import { randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { logForDebugging } from '../utils/debug.js'
 import { normalizePathForSandbox } from './sandbox-utils.js'
+import {
+  JWT_DEFAULT_EXTRACT_PATTERN,
+  mintFakeJwt,
+  verifyJwt,
+} from './credential-decode.js'
 import type { CredentialFileConfig } from './sandbox-config.js'
 import type { SentinelRegistry } from './credential-sentinel.js'
 
@@ -194,14 +200,20 @@ export class MaskedFileStore {
  * Whole-file mode (no `extract`): one sentinel keyed `file:<path>` whose
  * real value is the entire file content; the fake file *is* the sentinel.
  *
- * Structured mode (`extract` set): one sentinel per distinct captured
- * value, keyed `file:<path>#<i>`; the fake file is the real content with
- * each captured span replaced by its sentinel. If the regex matches
- * nothing the entry is **skipped with a loud stderr warning** — fail-open:
- * no bind, no deny, the file stays readable via the root mount. The
- * operator's regex is treated as a config error to surface and fix, not a
- * reason to block file access; a wrong pattern should not break a tool
- * that needs the file when the credential is legitimately absent.
+ * Structured mode (`extract` and/or `decode` set): one sentinel per
+ * distinct captured value, keyed `file:<path>#<i>`; the fake file is the
+ * real content with each captured span replaced by its sentinel. With
+ * `decode: "jwt"`, candidates come from the explicit `extract` pattern or
+ * the built-in JWT pattern, each candidate must pass {@link verifyJwt}
+ * before it is masked (failed candidates are left untouched), and the
+ * sentinel is a JWT-shaped fake ({@link mintFakeJwt}) registered via
+ * `registerWithSentinel`. If the regex matches nothing — or, with decode,
+ * no candidate verifies — the entry is **skipped with a loud stderr
+ * warning** — fail-open: no bind, no deny, the file stays readable via the
+ * root mount. The operator's regex is treated as a config error to surface
+ * and fix, not a reason to block file access; a wrong pattern should not
+ * break a tool that needs the file when the credential is legitimately
+ * absent.
  *
  * Entries whose path does not exist, is unreadable, or resolves to a
  * directory are skipped with a debug log — same posture as a masked env
@@ -260,23 +272,49 @@ export function buildMaskedFileBinds(
     const key = FILE_KEY_PREFIX + realPath
 
     let fakeContent: string
-    if (f.extract === undefined) {
+    if (f.extract === undefined && f.decode === undefined) {
       // Whole-file: one sentinel for the entire content.
       fakeContent = registry.register(key, content, injectHosts)
     } else {
-      const extracted = extractAndSubstitute(content, f.extract, (cap, i) =>
-        registry.register(`${key}#${i}`, cap, injectHosts),
-      )
-      if (extracted === null) {
-        // Fail-open: a non-matching extract pattern is a config error to
-        // surface, not a reason to block file access. Skip the entry (no
-        // bind, no deny) — the file stays readable via the root mount —
-        // and warn loudly on stderr so the operator fixes the regex.
+      // An explicit extract pattern wins; decode without one falls back to
+      // the built-in JWT pattern so authors don't hand-write it.
+      const pattern = f.extract ?? JWT_DEFAULT_EXTRACT_PATTERN
+      let maskedCount = 0
+      const extracted = extractAndSubstitute(content, pattern, (cap, i) => {
+        // Decode-verification: a regex match that is not actually a JWT
+        // (the default pattern over-matches by design) is left untouched —
+        // returning the capture replaces the span with itself.
+        if (f.decode === 'jwt' && !verifyJwt(cap)) return cap
+        maskedCount++
+        const name = `${key}#${i}`
+        // For decode the fake must keep the token's shape: a JWT-shaped
+        // sentinel keeps client-side parsers (segment count, payload
+        // decode, exp checks) working inside the sandbox.
+        return f.decode === 'jwt'
+          ? registry.registerWithSentinel(
+              name,
+              mintFakeJwt(randomUUID()),
+              cap,
+              injectHosts,
+            )
+          : registry.register(name, cap, injectHosts)
+      })
+      if (extracted === null || maskedCount === 0) {
+        // Fail-open: a non-matching pattern (or, with decode, no candidate
+        // surviving verification) is a config error to surface, not a
+        // reason to block file access. Skip the entry (no bind, no deny) —
+        // the file stays readable via the root mount — and warn loudly on
+        // stderr so the operator fixes the config.
+        const cause =
+          f.decode === 'jwt'
+            ? `decode "jwt" with pattern "${pattern}" that matched no ` +
+              `verified JWT`
+            : `extract pattern "${pattern}" that matched nothing`
         const msg =
           `[sandbox-runtime] WARNING: credentials.files entry ` +
-          `"${f.path}" has extract pattern "${f.extract}" that matched ` +
-          `nothing in the file. The file is left UNPROTECTED (readable ` +
-          `as-is inside the sandbox). Fix the regex or remove the entry.`
+          `"${f.path}" has ${cause} in the file. The file is left ` +
+          `UNPROTECTED (readable as-is inside the sandbox). Fix the ` +
+          `config or remove the entry.`
         console.warn(msg)
         logForDebugging(msg, { level: 'warn' })
         continue
