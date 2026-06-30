@@ -190,9 +190,28 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * left readable as-is (unprotected) — fix the regex or remove the entry.
  * A future option may make this behaviour configurable.
  *
+ * `mode: "mask"` with `decode: "jwt"` handles files containing JWTs:
+ *
+ * - **Default pattern**: when `extract` is absent, a built-in JWT regex is
+ *   used (every JWT starts `eyJ` — base64url of `{"`), so authors don't
+ *   hand-write it. An explicit `extract` wins; its group-1 captures are the
+ *   candidates.
+ * - **Decode-verification**: each candidate must actually BE a JWT (three
+ *   segments, JSON header/payload, `alg` in the header) before it is
+ *   masked; candidates failing verification are left untouched.
+ * - **JWT-shaped sentinel**: the fake written into the masked file is a
+ *   structurally valid JWT (parseable header/payload, far-future `exp`),
+ *   so client-side token parsing inside the sandbox doesn't break. Its
+ *   header declares `alg: HS256` (not `alg: none`, which misconfigured
+ *   validators accept) with a garbage signature, so any validator the
+ *   unswapped fake reaches rejects it.
+ * - **Fail-open**: if nothing matches or no candidate verifies, a warning
+ *   is emitted to stderr and the file is left readable as-is — same
+ *   behaviour as a non-matching `extract`.
+ *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
- * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
- * inside the sandbox).
+ * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
+ * unreadable inside the sandbox).
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
@@ -209,6 +228,18 @@ export const CredentialFileConfigSchema = z.object({
         'and the file is left readable as-is (unprotected) — fix the regex ' +
         'or remove the entry. A future option may make this configurable. ' +
         'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+    ),
+  decode: z
+    .enum(['jwt'])
+    .optional()
+    .describe(
+      'Optional encoded-credential format. "jwt": candidates are located ' +
+        'with a built-in JWT regex (or the explicit extract pattern, if ' +
+        'set), verified to actually be JWTs before masking, and replaced ' +
+        'with a structurally valid fake JWT so client-side token parsing ' +
+        'keeps working. If no candidate verifies, a warning is emitted and ' +
+        'the file is left readable as-is. Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
     ),
   injectHosts: z
     .array(domainPatternSchema)
