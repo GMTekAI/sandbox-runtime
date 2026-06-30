@@ -386,70 +386,71 @@ function groupRefArgs(ref: WindowsGroupRef): string[] {
 
 interface RunResult {
   status: number | null
+  signal: NodeJS.Signals | null
   stdout: string
   stderr: string
 }
 
 function runSrtWin(
   args: string[],
-  stdin?: string,
   timeoutMs = 15_000,
+  stdin?: string,
 ): RunResult {
   const exe = getSrtWinPath()
   const r = spawnSync(exe, args, {
     encoding: 'utf8',
     timeout: timeoutMs,
-    ...(stdin !== undefined && { input: stdin }),
+    ...(stdin !== undefined ? { input: stdin } : {}),
   })
   if (r.error) {
     throw new Error(`srt-win ${args[0]}: spawn failed: ${r.error.message}`)
   }
   return {
     status: r.status,
+    signal: r.signal,
     stdout: (r.stdout ?? '').trim(),
     stderr: (r.stderr ?? '').trim(),
   }
 }
 
-// Default: throw on exit≠0 (fail-safe). The one caller that needs
-// the JSON despite a non-zero exit (`acl restore --json`, which
-// prints per-path outcomes and THEN errors when any path stayed
-// stamped) opts in via `allowNonZero: true` and gets the
-// `{ok, json, stderr}` shape. Status callers stay one-liners and
-// cannot regress to silently treating exit≠0 as success.
-function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T
-function runSrtWinJson<T>(
-  args: string[],
-  opts: { timeoutMs?: number; allowNonZero: true },
-): { ok: boolean; json: T; stderr: string }
-function runSrtWinJson<T>(
-  args: string[],
-  opts?: { timeoutMs?: number; allowNonZero?: boolean },
-): T | { ok: boolean; json: T; stderr: string } {
-  const r = runSrtWin(args, undefined, opts?.timeoutMs)
-  // Parse stdout BEFORE the exit-code check so `allowNonZero`
-  // can hand back the JSON on exit≠0. JSON.parse never returns
-  // `undefined`, so `json !== undefined` ⇔ parse succeeded.
-  let json: T | undefined
-  let parseErr: string | undefined
-  try {
-    json = JSON.parse(r.stdout) as T
-  } catch (e) {
-    parseErr = (e as Error).message
-  }
-  if (opts?.allowNonZero && json !== undefined) {
-    return { ok: r.status === 0, json, stderr: r.stderr }
-  }
+function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
+  const r = runSrtWin(args, opts?.timeoutMs)
   if (r.status !== 0) {
     throw new Error(
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
     )
   }
-  if (json !== undefined) return json
-  throw new Error(
-    `srt-win ${args.join(' ')}: unparseable JSON output ` +
-      `${JSON.stringify(r.stdout)}: ${parseErr}`,
-  )
+  try {
+    return JSON.parse(r.stdout) as T
+  } catch (e) {
+    throw new Error(
+      `srt-win ${args.join(' ')}: unparseable JSON output ` +
+        `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
+    )
+  }
+}
+
+/**
+ * As {@link runSrtWinJson} but parses stdout BEFORE checking the
+ * exit code, so a non-zero exit with the per-path JSON intact
+ * still surfaces every entry. For best-effort teardown helpers
+ * (`acl restore`/`acl revoke`).
+ */
+function runSrtWinJsonAllowFail<T>(
+  args: string[],
+  timeoutMs: number,
+): { ok: boolean; json: T; stderr: string } {
+  const r = runSrtWin(args, timeoutMs)
+  let json: T
+  try {
+    json = JSON.parse(r.stdout) as T
+  } catch (e) {
+    throw new Error(
+      `srt-win ${args.join(' ')}: unparseable JSON output ` +
+        `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
+    )
+  }
+  return { ok: r.status === 0, json, stderr: r.stderr }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -566,11 +567,7 @@ export async function verifyWindowsWfpEgress(
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
     // same budget as windowsTrustCa, plus the runner's own 2s
     // connect timeout.
-    const r = runSrtWin(
-      ['wfp', 'verify', '--target', target],
-      undefined,
-      30_000,
-    )
+    const r = runSrtWin(['wfp', 'verify', '--target', target], 30_000)
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
@@ -690,7 +687,7 @@ export function getWindowsSandboxCaCert(
 export function windowsTrustCa(caCertPath: string): void {
   // 60s: first call may create the sandbox user's profile
   // (LOGON_WITH_PROFILE) via the one-shot CreateProcessWithLogonW.
-  const r = runSrtWin(['user', 'trust-ca', caCertPath], undefined, 60_000)
+  const r = runSrtWin(['user', 'trust-ca', caCertPath], 60_000)
   logForDebugging(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -773,7 +770,7 @@ export function installWindowsSandbox(
   }
   if (opts.force) args.push('--force')
 
-  const r = runSrtWin(args, undefined, 60_000)
+  const r = runSrtWin(args, 60_000)
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1085,7 +1082,7 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
   if (opts.sandboxUserSid) {
     args.push('--sandbox-user-sid', opts.sandboxUserSid)
   }
-  const r = runSrtWin(args, stdin, 60_000)
+  const r = runSrtWin(args, 60_000, stdin)
   logForDebugging(
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1140,17 +1137,14 @@ export function restoreWindowsAcl(
     args.push('--sandbox-user-sid', opts.sandboxUserSid)
   }
   // Don't let a teardown helper throw — the caller's reset() must
-  // complete. runSrtWinJson parses stdout before checking the
-  // exit code, so a non-zero exit with the per-path JSON intact
+  // complete. runSrtWinJsonAllowFail parses stdout before checking
+  // the exit code, so a non-zero exit with the per-path JSON intact
   // (`acl restore` prints outcomes THEN errors when any path
   // stayed stamped) still surfaces every entry to reset()'s loop
   // instead of collapsing to `undefined`. Only spawn-fail /
   // unparseable output throws → log and return undefined.
   try {
-    const r = runSrtWinJson<WindowsAclRestoreResult>(args, {
-      timeoutMs: 60_000,
-      allowNonZero: true,
-    })
+    const r = runSrtWinJsonAllowFail<WindowsAclRestoreResult>(args, 60_000)
     if (!r.ok) {
       logForDebugging(
         `[Sandbox Windows] acl restore exited non-zero (per-path ` +
@@ -1212,8 +1206,8 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
       '--sandbox-user-sid',
       opts.sandboxUserSid,
     ],
-    stdin,
     60_000,
+    stdin,
   )
   logForDebugging(
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -1250,7 +1244,7 @@ export function revokeWindowsAcl(opts: {
 }): WindowsAclGrantOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
   try {
-    const r = runSrtWinJson<WindowsAclGrantOutcome[]>(
+    const r = runSrtWinJsonAllowFail<WindowsAclGrantOutcome[]>(
       [
         'acl',
         'revoke',
@@ -1261,7 +1255,7 @@ export function revokeWindowsAcl(opts: {
         opts.sandboxUserSid,
         '--json',
       ],
-      { timeoutMs: 60_000, allowNonZero: true },
+      60_000,
     )
     if (!r.ok) {
       logForDebugging(
