@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "srt-win"
-path = "src/main.rs"
+path = "src/cli.rs"
 
 [dependencies]
 anyhow = "1"
