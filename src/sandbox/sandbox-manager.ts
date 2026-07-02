@@ -8,7 +8,7 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
-import { mintFakeJwt, verifyJwt } from './credential-decode.js'
+import { maskJwtClaims, mintFakeJwt, verifyJwt } from './credential-decode.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -695,8 +695,17 @@ function checkDependencies(ripgrepConfig?: {
  * the value is verified ({@link verifyJwt}) and replaced by a JWT-shaped
  * fake ({@link mintFakeJwt}) registered as a caller-minted sentinel, so
  * token-parsing tools inside the sandbox keep working and the proxy swaps
- * the whole fake token on egress. A set value that does not verify fails
- * open with a loud stderr warning (see {@link CredentialEnvVarConfigSchema}).
+ * the whole fake token on egress. With `maskClaims`, masking goes one
+ * level deeper: each named top-level payload claim present with a string
+ * value gets its own sentinel and the token is rebuilt around the modified
+ * payload ({@link maskJwtClaims}); BOTH mappings are registered — the
+ * whole fake token → the whole real token (a tool sending the token as a
+ * bearer credential) and each claim sentinel → the real claim value (a
+ * tool extracting the claim and sending it alone) — under the same
+ * injectHosts. Named claims absent or non-string are skipped with a debug
+ * log. A set value that does not verify — or, with `maskClaims`, verifies
+ * but has no named claim present as a string — fails open with a loud
+ * stderr warning (see {@link CredentialEnvVarConfigSchema}).
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
@@ -743,6 +752,52 @@ function getCredentialRestrictions(
             `the entry.`
           console.warn(msg)
           logForDebugging(msg, { level: 'warn' })
+          continue
+        }
+        if (v.maskClaims?.length) {
+          // Claim-level masking: sentinels go INSIDE the payload; the
+          // rebuilt fake token is itself registered as a sentinel for the
+          // whole real token, so both the bearer path (token sent
+          // verbatim) and the extracted-claim path substitute on egress.
+          const masked = maskJwtClaims(real, v.maskClaims, (claim, value) =>
+            sentinelRegistry.register(
+              `env:${v.name}#${claim}`,
+              value,
+              injectHosts,
+            ),
+          )
+          if (masked === null) {
+            // A verified JWT none of whose named claims are present as
+            // strings: nothing was masked — same fail-open posture as a
+            // value that does not verify (this will route through a
+            // per-entry policy once onExtractNoMatch unifies with env vars).
+            const msg =
+              `[sandbox-runtime] WARNING: credentials.envVars entry ` +
+              `"${v.name}" has maskClaims ` +
+              `${JSON.stringify(v.maskClaims)} but none is present as a ` +
+              `string claim in its JWT value. The variable is left ` +
+              `UNPROTECTED (real value visible as-is inside the sandbox). ` +
+              `Fix the config or remove the entry.`
+            console.warn(msg)
+            logForDebugging(msg, { level: 'warn' })
+            continue
+          }
+          const skipped = v.maskClaims.filter(
+            c => !masked.claimSentinels.has(c),
+          )
+          if (skipped.length > 0) {
+            logForDebugging(
+              `[credential-mask] env var "${v.name}": maskClaims ` +
+                `${JSON.stringify(skipped)} absent or non-string in the ` +
+                `JWT — skipped.`,
+            )
+          }
+          setEnvVars[v.name] = sentinelRegistry.registerWithSentinel(
+            'env:' + v.name,
+            masked.fakeToken,
+            real,
+            injectHosts,
+          )
           continue
         }
         // JWT-shaped fake so token-parsing tools inside the sandbox keep
