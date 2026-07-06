@@ -418,13 +418,8 @@ fn recompose_dacl(
     //    first (preserves the original ACE order — DENYs, if any,
     //    stay ahead of our appended ALLOW).
     let sid = PSID(target_sid.as_ptr() as *mut c_void);
-    let new = rebuild_acl(
-        kept.src_rev,
-        &[],
-        &kept,
-        &[NewAce::Allow(sid, mask, NO_INHERIT)],
-    )
-    .with_context(|| format!("rebuild_acl({what})"))?;
+    let new = rebuild_acl(kept.2, &[], &kept, &[NewAce::Allow(sid, mask, NO_INHERIT)])
+        .with_context(|| format!("rebuild_acl({what})"))?;
 
     // 4) Write back via a fresh absolute SD.
     let mut sd: SECURITY_DESCRIPTOR = Default::default();

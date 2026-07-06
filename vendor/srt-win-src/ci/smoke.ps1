@@ -136,23 +136,26 @@ Remove-Item -ea SilentlyContinue (Join-Path $stateDir 'state.db-wal'),
 $bytes = [System.IO.File]::ReadAllBytes($db)
 $bytes[60] = 0; $bytes[61] = 0; $bytes[62] = 0; $bytes[63] = 1
 [System.IO.File]::WriteAllBytes($db, $bytes)
-# M1b: open_db_ro() bails on v≠SCHEMA (fail-closed — an empty
-# fence-plan would otherwise run the child unfenced). `user status`
-# routes through it via read_ca_cert()? → exits non-zero with the
-# migrate hint.
+# M1b: open_db_ro() warns + returns None on v≠SCHEMA. Post fence
+# removal Ok(None) is fail-safe — `user status` reports
+# cred_present:false and exec exit-15s on it. Assert: exit 0 +
+# warning + cred_present:false in the JSON.
 $m1b = & $Exe user status 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0) {
-  throw "M1b: user status on stale-schema DB expected non-zero exit; got 0. out: $m1b"
+if ($LASTEXITCODE -ne 0) {
+  throw "M1b: user status on stale-schema DB expected exit 0 (warn+None); got $LASTEXITCODE. out: $m1b"
 }
 if ($m1b -notmatch '(?i)schema v1.*expected v\d+.*re-run.*install') {
-  throw "M1b: expected 'schema v1, expected vN; re-run install' hint. out: $m1b"
+  throw "M1b: expected 'schema v1, expected vN; re-run install' warning. out: $m1b"
 }
-Write-Host "M1b ok: user status fails closed on stale schema"
-# install (no --force): read_setup().ok() swallows the same Err →
-# None → idempotent early-out FALLS THROUGH ("partial install
-# detected … completing"), reaching write_setup() → open_db_at() →
-# .bak rename. Regression-guard: "already installed; no changes" =
-# open_db_ro() lost the version check.
+if ($m1b -notmatch '"cred_present"\s*:\s*false') {
+  throw "M1b: expected cred_present:false in status JSON. out: $m1b"
+}
+Write-Host "M1b ok: user status warns + reports not-provisioned on stale schema"
+# install (no --force): read_setup() → open_db_ro() → Ok(None) →
+# idempotent early-out FALLS THROUGH ("partial install detected …
+# completing"), reaching write_setup() → open_db_at() → .bak rename.
+# Regression-guard: "already installed; no changes" = open_db_ro()
+# lost the version check.
 $m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE. out: $m1out" }
 if ($m1out -match '(?i)already installed.*no changes') {

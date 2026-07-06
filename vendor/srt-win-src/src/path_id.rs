@@ -159,9 +159,10 @@ fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
 }
 
 /// Immediate parent of a `\\?\…` canonical path, as a string.
-/// Returns `None` when there is no stampable parent (the path
-/// is a root, or its immediate parent is a root — stamping a
-/// volume root would propagate the allow-list across the drive).
+/// Returns `None` when there is no targetable parent (the path is
+/// a root, or its immediate parent is a root — touching the
+/// volume root's DACL is out of scope for the parent
+/// `DenyFdc` ACE).
 pub fn canonical_parent_of(canonical_path: &str) -> Option<String> {
     std::path::Path::new(canonical_path)
         .parent()
@@ -203,14 +204,6 @@ impl FileId {
             id128: id,
         })
     }
-    pub fn to_hex(&self) -> String {
-        let b = self.as_bytes();
-        let mut s = String::with_capacity(48);
-        for x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
-    }
 }
 
 /// `FILE_ID_INFO` of an already-open handle.
@@ -232,6 +225,15 @@ fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
         volume_serial: info.VolumeSerialNumber,
         id128: info.FileId.Identifier,
     })
+}
+
+/// `FILE_ID_INFO` of `canonical_path`. Opens with no data access
+/// (identity query only), so a DENY-ACE on the file does not
+/// interfere — the broker is the real user, not the deny trustee.
+pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
+    let h = open_for_metadata(canonical_path)
+        .with_context(|| format!("open '{canonical_path}' for file_id"))?;
+    file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
 }
 
 /// `(file_id, NumberOfLinks, is_dir)` from ONE metadata open.
@@ -264,15 +266,6 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)>
         )
     })?;
     Ok((id, std_info.NumberOfLinks, std_info.Directory))
-}
-
-/// `FILE_ID_INFO` of `canonical_path`. Opens with no data access
-/// (identity query only), so a broker-only DACL on the file does
-/// not interfere.
-pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
-    let h = open_for_metadata(canonical_path)
-        .with_context(|| format!("open '{canonical_path}' for file_id"))?;
-    file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
 }
 
 /// Best-effort: locate the CURRENT path of a file by its captured
@@ -365,13 +358,12 @@ mod tests {
     }
 
     /// The parent of a file directly under a drive root IS the
-    /// volume root. Stamping a volume root with the PROTECTED
-    /// inherit-to-children allow-list DACL would re-propagate
-    /// across every file on the drive — so `canonical_parent_of`
-    /// must return `None` for a top-level child, routing it to
-    /// the handle-fence fallback instead. Rust's `Path::parent()`
-    /// returns the root (not `None`) in this case, so the helper
-    /// has to recognize and reject it.
+    /// volume root. Touching the volume root's DACL (even with an
+    /// additive `DenyFdc` ACE) is out of scope — so
+    /// `canonical_parent_of` must return `None` for a top-level
+    /// child. Rust's `Path::parent()` returns the root (not
+    /// `None`) in this case, so the helper has to recognize and
+    /// reject it.
     #[test]
     fn parent_at_volume_root_is_not_stampable() {
         for p in [r"\\?\C:\foo.txt", r"\\?\C:\ProgramData", r"\\?\D:\x"] {
