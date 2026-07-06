@@ -236,7 +236,7 @@ export interface WindowsSandboxParams {
    * fails if any path cannot be stamped).
    *
    * Normalized concrete paths — globs expanded by the caller via
-   * {@link expandWindowsFsDenyPaths}, the same as session-level.
+   * {@link expandWindowsFsPaths}, the same as session-level.
    * `srt-win exec`'s `canonicalize_ace_targets` hard-fails on a
    * glob (it never expands), so a `*`/`?` reaching this field is
    * a caller bug.
@@ -877,17 +877,17 @@ export function uninstallWindowsSandbox(
 }
 
 /**
- * Expand glob patterns in `patterns` to concrete paths via the
- * single platform-aware {@link normalizePathForSandbox} chokepoint
- * (Linux/macOS parity: point-in-time expansion at session
- * initialize, not per-exec). Non-glob paths are normalized and
+ * Resolve any Windows filesystem-config path list — `allowRead`/
+ * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
+ * concrete existing paths via the single platform-aware
+ * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
+ * point-in-time expansion at session initialize, not per-exec).
+ * Glob patterns are expanded; non-glob paths are normalized and
  * returned 1:1. Missing paths are dropped (statSync probe).
  * Directory targets are accepted — the additive sandbox-user ACE
  * carries `(OI)(CI)` so it covers the subtree.
  */
-export function expandWindowsFsDenyPaths(
-  patterns: readonly string[],
-): string[] {
+export function expandWindowsFsPaths(patterns: readonly string[]): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
@@ -925,7 +925,7 @@ export interface WindowsAclStampOptions {
  *
  * Inputs are passed verbatim to `srt-win` (which canonicalizes and
  * rejects globs). Callers that accept globs should pre-expand via
- * {@link expandWindowsFsDenyPaths}.
+ * {@link expandWindowsFsPaths}.
  *
  * @throws on exit ≠ 0 — including exit 2 (one or more inputs
  *   skipped). srt-win stamps the resolvable inputs before exiting

@@ -47,7 +47,7 @@ import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -953,7 +953,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   if (fs?.disabled) {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
-  const expand = expandWindowsFsDenyPaths
+  const expand = expandWindowsFsPaths
   const denyRead = expand([
     ...new Set([
       ...(fs?.denyRead ?? []),
@@ -1391,7 +1391,7 @@ async function wrapWithSandboxArgv(
     )
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
-    // Paths go through `expandWindowsFsDenyPaths` — the SAME
+    // Paths go through `expandWindowsFsPaths` — the SAME
     // chokepoint the session-level set uses (point-in-time glob
     // expand, normalize, missing→drop) — so a per-exec entry
     // resolves identically to its session-level equivalent.
@@ -1432,7 +1432,7 @@ async function wrapWithSandboxArgv(
       if (rawRead.length > 0 || rawWrite.length > 0) {
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsDenyPaths
+        const expand = expandWindowsFsPaths
         perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
         perExecDenyWrite = expand(rawWrite).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),

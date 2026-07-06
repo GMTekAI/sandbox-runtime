@@ -1179,7 +1179,7 @@ describe.if(isWindows)(
       // before this PR a per-exec `glob-*.secret` reached
       // `srt-win exec --deny-read` raw and `canonicalize_path`
       // hard-failed; now `wrapWithSandboxArgv` routes it through
-      // `expandWindowsFsDenyPaths` (same chokepoint as session-
+      // `expandWindowsFsPaths` (same chokepoint as session-
       // level) so the child sees two concrete `--deny-read` paths.
       const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
       const a = join(dir, 'glob-a.secret')

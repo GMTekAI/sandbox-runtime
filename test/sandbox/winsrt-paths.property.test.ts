@@ -7,7 +7,7 @@ import {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
 } from '../../src/sandbox/sandbox-utils.js'
-import { expandWindowsFsDenyPaths } from '../../src/sandbox/windows-sandbox-utils.js'
+import { expandWindowsFsPaths } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
  * Property tests for the Windows path-normalisation pipeline.
@@ -58,7 +58,7 @@ describe('property: containsGlobCharsWin', () => {
   })
 })
 
-describe('property: expandWindowsFsDenyPaths', () => {
+describe('property: expandWindowsFsPaths', () => {
   let scratch: string
   const files: string[] = []
 
@@ -81,8 +81,8 @@ describe('property: expandWindowsFsDenyPaths', () => {
     // round-trip.
     fc.assert(
       fc.property(fc.subarray(files, { minLength: 1 }), subset => {
-        const once = expandWindowsFsDenyPaths(subset)
-        const twice = expandWindowsFsDenyPaths(once)
+        const once = expandWindowsFsPaths(subset)
+        const twice = expandWindowsFsPaths(once)
         return (
           once.length === twice.length &&
           new Set(once).size === once.length &&
