@@ -62,21 +62,6 @@ d('linux-violation-monitor (listener)', () => {
     expect(violations[0].encodedCommand).toBe('dGVzdA==')
   })
 
-  it('config disableViolationMonitoring vetoes the monitor', async () => {
-    const { SandboxRuntimeConfigSchema } = await import(
-      '../../src/sandbox/sandbox-config.js'
-    )
-    const parsed = SandboxRuntimeConfigSchema.safeParse({
-      network: { allowedDomains: [], deniedDomains: [] },
-      filesystem: { allowWrite: [], denyWrite: [], denyRead: [] },
-      disableViolationMonitoring: true,
-    })
-    expect(parsed.success).toBe(true)
-    if (parsed.success) {
-      expect(parsed.data.disableViolationMonitoring).toBe(true)
-    }
-  })
-
   it('drops unresolved relative paths instead of guessing', async () => {
     // apply-seccomp resolves relative paths before emitting; a relative
     // path here means resolution failed. Best-effort telemetry: never

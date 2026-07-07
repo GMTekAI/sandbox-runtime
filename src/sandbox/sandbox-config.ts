@@ -641,14 +641,6 @@ export const SandboxRuntimeConfigSchema = z
     ignoreViolations: IgnoreViolationsConfigSchema.optional().describe(
       'Optional configuration for ignoring specific violations',
     ),
-    disableViolationMonitoring: z
-      .boolean()
-      .optional()
-      .describe(
-        'Disable sandbox violation monitoring/reporting entirely, even ' +
-          'when the embedder requests it. Reporting only — enforcement ' +
-          'is unaffected.',
-      ),
     enableWeakerNestedSandbox: z
       .boolean()
       .optional()
