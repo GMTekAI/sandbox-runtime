@@ -452,6 +452,20 @@ pub struct SetupInfo {
 /// is [`set_ca_cert`]. Install is sequential under self-elevation,
 /// so the caller doesn't need [`with_init_lock`].
 pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
+    // Single-row invariant: [`read_setup_info`] does `LIMIT 1`, so a
+    // `--force` re-install under a different `--sandbox-user` name
+    // must not leave the old row behind (the ON CONFLICT keys on
+    // username and would insert a second row). This DOES drop the
+    // old row's `ca_cert` — intentionally: the CA was written into
+    // the OLD user's `CurrentUser\Root` hive, so preserving the
+    // record for the NEW user would lie about a Root install that
+    // hasn't happened. Same-name re-install skips this DELETE and
+    // the ON CONFLICT below preserves `ca_cert`.
+    conn.execute(
+        "DELETE FROM sandbox_user WHERE username != ?1",
+        params![info.sandbox_user],
+    )
+    .context("DELETE stale sandbox_user row")?;
     conn.execute(
         "INSERT INTO sandbox_user \
            (username, user_sid, group_sid, cred, marker_version, \

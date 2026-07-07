@@ -41,7 +41,10 @@ use windows::core::{PCWSTR, PWSTR};
 use crate::util::{pcwstr, wstr};
 use crate::{sam, sid};
 
-/// The dedicated local account the sandboxed child runs as.
+/// Default name for the dedicated local account the sandboxed child
+/// runs as. Overridable at install time via `--sandbox-user`; the
+/// active name is recorded in the setup marker
+/// ([`crate::install::read_setup`]).
 pub const SANDBOX_USER: &str = "srt-sandbox";
 
 /// Local group that holds [`SANDBOX_USER`]. Trustee for the
@@ -68,6 +71,9 @@ pub struct ProvisionedUser {
 /// surfaced rather than collapsed to a single boolean.
 #[derive(Debug, Serialize)]
 pub struct UserStatus {
+    /// The account name that was queried (from the setup marker, or
+    /// [`SANDBOX_USER`] when no install has run).
+    pub name: String,
     pub exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
@@ -89,19 +95,24 @@ const WINLOGON_USERLIST: &str =
 /// unlike the *name* "Users" / "Benutzer" / "Utilisateurs".
 const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
 
-/// Create [`SANDBOX_GROUP`] and [`SANDBOX_USER`] (idempotent), set a
-/// fresh random password (rotated if the user already exists), add
-/// the user to `BUILTIN\Users` and [`SANDBOX_GROUP`], hide it from
-/// the Winlogon user-picker, and return both SIDs plus the password.
+/// Create [`SANDBOX_GROUP`] and the local user `name` (idempotent),
+/// set a fresh random password (rotated only if `we_own_it` — see
+/// [`ensure_user`]), add the user to `BUILTIN\Users` and
+/// [`SANDBOX_GROUP`], hide it from the Winlogon user-picker, and
+/// return both SIDs plus the password.
+///
+/// `we_own_it` — the setup marker records `name` as the account a
+/// prior `srt-win install` created. When false, a pre-existing
+/// principal by that name is refused rather than adopted.
 ///
 /// Requires elevation (NetUserAdd → `ERROR_ACCESS_DENIED` otherwise).
-pub fn provision() -> Result<ProvisionedUser> {
+pub fn provision(name: &str, we_own_it: bool) -> Result<ProvisionedUser> {
     sam::ensure_local_group(SANDBOX_GROUP, "sandbox-runtime sandbox-user group")?;
-    let password = ensure_user(SANDBOX_USER)?;
+    let password = ensure_user(name, we_own_it)?;
 
     // Resolve the freshly-created user's SID so group membership is
     // added by PSID — see [`sam::add_member`].
-    let sid = sid::lookup_account_sid(SANDBOX_USER).context("resolve sandbox user SID")?;
+    let sid = sid::lookup_account_sid(name).context("resolve sandbox user SID")?;
     let user_psid = sid::LocalPsid::from_string(&sid)?;
 
     // BUILTIN\Users membership is required for the account to hold
@@ -113,25 +124,25 @@ pub fn provision() -> Result<ProvisionedUser> {
     sam::add_member(&builtin_users, &user_psid)?;
     sam::add_member(SANDBOX_GROUP, &user_psid)?;
 
-    set_logon_ui_hidden(SANDBOX_USER, true)?;
+    set_logon_ui_hidden(name, true)?;
 
     let group_sid = sid::lookup_account_sid(SANDBOX_GROUP).context("resolve sandbox group SID")?;
     Ok(ProvisionedUser {
-        username: SANDBOX_USER.into(),
+        username: name.into(),
         sid,
         group_sid,
         password,
     })
 }
 
-/// Delete [`SANDBOX_USER`]'s roaming/local profile (best-effort),
-/// the account itself, [`SANDBOX_GROUP`], and the Winlogon hide
-/// value. Idempotent — every step tolerates already-absent state.
-pub fn deprovision() -> Result<()> {
+/// Delete `name`'s roaming/local profile (best-effort), the account
+/// itself, [`SANDBOX_GROUP`], and the Winlogon hide value.
+/// Idempotent — every step tolerates already-absent state.
+pub fn deprovision(name: &str) -> Result<()> {
     // Profile delete needs the SID *string*; resolve before
     // NetUserDel removes the SAM mapping. Failure to resolve (user
     // already gone) is fine — no profile to delete.
-    if let Ok(s) = sid::lookup_account_sid(SANDBOX_USER) {
+    if let Ok(s) = sid::lookup_account_sid(name) {
         let sid_w = wstr(&s);
         // Best-effort: profile may never have been created (no
         // `LOGON_WITH_PROFILE` yet), or may be locked by a stuck
@@ -140,21 +151,21 @@ pub fn deprovision() -> Result<()> {
             let _ = DeleteProfileW(pcwstr(&sid_w), PCWSTR::null(), PCWSTR::null());
         }
     }
-    let user_w = wstr(SANDBOX_USER);
+    let user_w = wstr(name);
     let rc = unsafe { NetUserDel(PCWSTR::null(), pcwstr(&user_w)) };
     if rc != 0 && rc != NERR_UserNotFound {
-        return Err(anyhow!("NetUserDel({SANDBOX_USER}): {rc}"));
+        return Err(anyhow!("NetUserDel({name}): {rc}"));
     }
     sam::delete_local_group(SANDBOX_GROUP)?;
     // Best-effort: the key may never have been created.
-    let _ = set_logon_ui_hidden(SANDBOX_USER, false);
+    let _ = set_logon_ui_hidden(name, false);
     Ok(())
 }
 
-/// Observe each piece of the provisioned state independently. Does
-/// not require elevation.
-pub fn status() -> Result<UserStatus> {
-    let sid = sid::lookup_account_sid(SANDBOX_USER).ok();
+/// Observe each piece of `name`'s provisioned state independently.
+/// Does not require elevation.
+pub fn status(name: &str) -> Result<UserStatus> {
+    let sid = sid::lookup_account_sid(name).ok();
     let group_sid = sid::lookup_account_sid(SANDBOX_GROUP).ok();
     let in_builtin_users = sid
         .as_deref()
@@ -166,13 +177,14 @@ pub fn status() -> Result<UserStatus> {
         _ => false,
     };
     Ok(UserStatus {
+        name: name.into(),
         exists: sid.is_some(),
         sid,
         group_exists: group_sid.is_some(),
         group_sid,
         in_builtin_users,
         in_sandbox_group,
-        hidden_from_logon: is_logon_ui_hidden(SANDBOX_USER),
+        hidden_from_logon: is_logon_ui_hidden(name),
     })
 }
 
@@ -253,8 +265,28 @@ fn gen_password() -> Result<String> {
 /// returns 2245 for *any* local-policy rejection (complexity /
 /// history / filter DLL), so a policy tightened between builds can
 /// bounce an otherwise-valid 32-char draw.
-fn ensure_user(name: &str) -> Result<String> {
+///
+/// `we_own_it` — the setup marker records `name` as an account a
+/// prior install created. When **false**, any principal that already
+/// resolves under `name` (local user, group, alias, domain
+/// principal) is refused rather than adopted: srt-win will not
+/// rotate the password of an account it didn't create.
+fn ensure_user(name: &str, we_own_it: bool) -> Result<String> {
     let mut name_w = wstr(name);
+    // Ownership guard runs FIRST, before any mutation, via
+    // `LookupAccountNameW` (resolves users, groups, aliases, domain
+    // principals alike) — so the friendly message is emitted
+    // regardless of which rc `NetUserAdd` would return for the name
+    // (`NERR_UserExists`/`NERR_GroupExists`/`ERROR_ALIAS_EXISTS`
+    // vary by kind). Not-found → create path.
+    if !we_own_it && sid::lookup_account_sid(name).is_ok() {
+        bail!(
+            "account '{name}' already exists and was not created by \
+             srt-win. Pick a different --sandbox-user name (or omit \
+             it for the default '{SANDBOX_USER}', which srt-win \
+             manages)."
+        );
+    }
     let mut comment_w = wstr("sandbox-runtime sandboxed-child account");
     // Bound in the header (defense-in-depth) *and* in the inner
     // `attempt + 1 < MAX_PW_ATTEMPTS` guards — the last iteration
@@ -497,7 +529,8 @@ mod tests {
         // The CI smoke installs/uninstalls under the real names, so
         // here we only sanity-check that status() doesn't error and
         // its booleans agree with `exists`.
-        let st = status().expect("status");
+        let st = status(SANDBOX_USER).expect("status");
+        assert_eq!(st.name, SANDBOX_USER);
         if !st.exists {
             assert!(st.sid.is_none());
             assert!(!st.in_builtin_users);

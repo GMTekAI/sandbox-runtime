@@ -15,6 +15,7 @@ import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
@@ -324,6 +325,22 @@ describe('parseWindowsBinShell (pure, all platforms)', () => {
     expect(() =>
       parseWindowsBinShell('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
     ).toThrow(/unrecognised binShell/)
+  })
+})
+
+describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
+  it('accepts a valid name and rejects empty / >20 chars', () => {
+    expect(
+      WindowsConfigSchema.safeParse({ sandboxUser: 'srt-sb-custom' }).success,
+    ).toBe(true)
+    expect(WindowsConfigSchema.safeParse({}).success).toBe(true)
+    // Windows local usernames are capped at 20 (LM20_UNLEN).
+    expect(
+      WindowsConfigSchema.safeParse({ sandboxUser: 'a'.repeat(21) }).success,
+    ).toBe(false)
+    expect(WindowsConfigSchema.safeParse({ sandboxUser: '' }).success).toBe(
+      false,
+    )
   })
 })
 

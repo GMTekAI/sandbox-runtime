@@ -382,4 +382,65 @@ if ($null -ne $usGone.ca_cert_thumb) {
 # Idempotent no-op: second uninstall must also exit 0.
 Run (@('uninstall') + $isl)
 
+# ── U1: --sandbox-user provisions under a custom name ──────────────
+# Not pre-created — install creates it. `user status` reads the name
+# from the setup marker, so it reports the custom name.
+Run (@('install', '--sandbox-user', 'srt-sb-custom') + $isl + $pr)
+$usc = J @('user', 'status')
+if ($usc.user.name -ne 'srt-sb-custom') {
+  throw "U1: expected user.name='srt-sb-custom', got '$($usc.user.name)'"
+}
+if (-not $usc.user.exists -or -not $usc.user.sid.StartsWith('S-1-5-21-')) {
+  throw "U1: srt-sb-custom not provisioned; got $($usc | ConvertTo-Json -Compress)"
+}
+Write-Host "U1 ok: --sandbox-user srt-sb-custom provisioned (sid=$($usc.user.sid))"
+# Re-install with the DEFAULT name and no --force → exit 13
+# (recorded name differs).
+& $Exe @(@('install') + $isl + $pr) 2>$null
+if ($LASTEXITCODE -ne 13) {
+  throw "U1: install with default name over srt-sb-custom expected exit 13, got $LASTEXITCODE"
+}
+# Uninstall reads the recorded name and removes srt-sb-custom.
+Run (@('uninstall') + $isl)
+net user srt-sb-custom 2>$null
+if ($LASTEXITCODE -eq 0) {
+  throw "U1: srt-sb-custom account still exists after uninstall"
+}
+Write-Host 'U1 ok: uninstall removes the recorded custom-name account'
+
+# ── U1c: --sandbox-user rejects a name we didn't create ────────────
+# `Administrators` resolves (as an alias) → the ownership guard at
+# ensure_user() entry fires (no state.db record) → provision() bails
+# → exit 14.
+$u1c = & $Exe @(@('install', '--sandbox-user', 'Administrators') + $isl + $pr) 2>&1 | Out-String
+if ($LASTEXITCODE -ne 14) {
+  throw "U1c: expected exit 14 for --sandbox-user Administrators, got $LASTEXITCODE. out: $u1c"
+}
+if ($u1c -notmatch 'already exists and was not created by srt-win') {
+  throw "U1c: expected 'already exists and was not created by srt-win' in output. out: $u1c"
+}
+Write-Host 'U1c ok: --sandbox-user Administrators refused (exit 14)'
+
+# ── U1d: --sandbox-user rejects a foreign local user ───────────────
+# Pre-create a local user srt-win has no record of → same ownership
+# guard fires (never rotate a password we didn't set). Random suffix
+# so a leftover from a prior run can't false-positive.
+$foreign = "srt-sb-f$(Get-Random -Max 99999)"
+net user $foreign ('Aa1!' + [guid]::NewGuid().ToString('N').Substring(0,16)) /add /Y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "U1d: net user $foreign /add failed" }
+try {
+  $u1d = & $Exe @(@('install', '--sandbox-user', $foreign) + $isl + $pr) 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 14) {
+    throw "U1d: expected exit 14 for foreign local user, got $LASTEXITCODE. out: $u1d"
+  }
+  if ($u1d -notmatch 'already exists and was not created by srt-win') {
+    throw "U1d: expected ownership-guard message. out: $u1d"
+  }
+  Write-Host "U1d ok: foreign local user '$foreign' refused (exit 14)"
+} finally {
+  net user $foreign /delete 2>$null
+}
+# U1c/U1d may have created SANDBOX_GROUP before bailing — clean up.
+Run (@('uninstall') + $isl)
+
 Write-Host 'srt-win smoke: OK'

@@ -110,7 +110,8 @@ enum Cmd {
     ///   10 — UAC prompt cancelled by the user
     ///   12 — WFP filter install failed
     ///   13 — already installed under this sublayer with a
-    ///        DIFFERENT port-range; pass `--force` to replace
+    ///        DIFFERENT port-range or sandbox-user name; pass
+    ///        `--force` to replace
     ///   14 — sandbox user provisioning failed
     ///   1  — other error (parse, elevation check, etc.)
     Install {
@@ -120,8 +121,14 @@ enum Cmd {
         /// Loopback port range (`LOW-HIGH`, default 60080-60089).
         #[arg(long, value_name = "LOW-HIGH")]
         proxy_port_range: Option<String>,
-        /// Replace an existing install whose port-range differs
-        /// (otherwise exits 13).
+        /// Name for the sandbox user account. Default:
+        /// `srt-sandbox`. srt-win only manages an account it
+        /// created — a name that already resolves to a principal
+        /// srt-win didn't provision is refused (exit 14).
+        #[arg(long)]
+        sandbox_user: Option<String>,
+        /// Replace an existing install whose port-range or
+        /// sandbox-user name differs (otherwise exits 13).
         #[arg(long)]
         force: bool,
     },
@@ -507,8 +514,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Install {
             sublayer_guid,
             proxy_port_range,
+            sandbox_user,
             force,
         } => {
+            use srt_win::{install, user};
             if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
@@ -518,63 +527,90 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
                 None => wfp::DEFAULT_PROXY_PORT_RANGE,
             };
+            let name = sandbox_user.as_deref().unwrap_or(user::SANDBOX_USER);
             // Idempotency / conflict pre-check. With a DIFFERENT
-            // port-range and no --force, refuse (exit 13) so an
-            // unintended config drift surfaces instead of silently
-            // overwriting. With the SAME range, only return early
-            // when the install is COMPLETE — i.e. the sandbox
-            // user is provisioned and the marker is current. A
-            // partial install falls through and the (idempotent)
-            // steps below complete it. A pre-existing install whose
-            // tags lack a port_range (legacy) is treated as
-            // "different" and requires --force.
+            // port-range or sandbox-user name and no --force, refuse
+            // (exit 13) so an unintended config drift surfaces
+            // instead of silently overwriting. With the SAME config,
+            // only return early when the install is COMPLETE — i.e.
+            // the sandbox user is provisioned and the marker is
+            // current. A partial install falls through and the
+            // (idempotent) steps below complete it. A pre-existing
+            // install whose tags lack a port_range (legacy) is
+            // treated as "different" and requires --force.
+            let existing = install::read_setup().ok().flatten();
+            let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && st.state == "installed"
             {
                 let want = [range.0, range.1];
-                if st.port_range == Some(want) {
-                    use srt_win::{install, user};
-                    let us = user::status()?;
-                    let mv = install::read_setup()
-                        .ok()
-                        .flatten()
-                        .map(|s| s.marker_version);
-                    if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) {
-                        eprintln!(
-                            "srt-win: already installed (sublayer={sl:?}, \
-                             port_range={}-{}, filters={}); no changes",
-                            range.0, range.1, st.filters,
-                        );
-                        return Ok(());
-                    }
-                    eprintln!(
-                        "srt-win: partial install detected \
-                         (user_provisioned={}, marker_version={:?}) — \
-                         completing",
-                        us.exists, mv,
-                    );
-                    // Fall through; the steps are idempotent.
-                }
-                if st.port_range != Some(want) {
-                    let have = st
+                if st.port_range != Some(want) || name_changed {
+                    let have_range = st
                         .port_range
                         .map(|[l, h]| format!("{l}-{h}"))
                         .unwrap_or_else(|| "<unknown>".into());
+                    let have_name = existing
+                        .as_ref()
+                        .map(|s| s.sandbox_user.as_str())
+                        .unwrap_or("<none>");
                     eprintln!(
                         "srt-win: error: already installed under \
-                         sublayer {sl:?} with port_range={have}; \
-                         pass --force to replace, or run `srt-win \
-                         uninstall` first."
+                         sublayer {sl:?} with port_range={have_range}, \
+                         sandbox_user='{have_name}'; requested \
+                         port_range={}-{}, sandbox_user='{name}'. \
+                         Pass --force to replace, or run `srt-win \
+                         uninstall` first.",
+                        range.0, range.1,
                     );
                     std::process::exit(13);
                 }
+                // Same config — early-out only if COMPLETE.
+                let us = user::status(name)?;
+                let mv = existing.as_ref().map(|s| s.marker_version);
+                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) {
+                    eprintln!(
+                        "srt-win: already installed (sublayer={sl:?}, \
+                         port_range={}-{}, sandbox_user='{name}', \
+                         filters={}); no changes",
+                        range.0, range.1, st.filters,
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "srt-win: partial install detected \
+                     (user_provisioned={}, marker_version={:?}) — \
+                     completing",
+                    us.exists, mv,
+                );
+                // Fall through; the steps are idempotent.
+            }
+            // With --force and a changed name, do NOT delete the
+            // prior account — it may be enterprise-managed. The old
+            // WFP filters are replaced (they key on the new SID);
+            // write_setup_info clears the old row. The account
+            // itself is left for the operator.
+            if force && name_changed {
+                let old = &existing.as_ref().unwrap().sandbox_user;
+                eprintln!(
+                    "srt-win: WARNING: replacing install with \
+                     sandbox_user='{old}' → '{name}'. The prior \
+                     '{old}' account is NOT deleted (may be \
+                     enterprise-managed) — remove it manually if \
+                     unused.",
+                );
             }
             // Sandbox user account + credential file + setup marker
-            // + user-SID-keyed WFP filters.
+            // + user-SID-keyed WFP filters. `we_own_it` gates
+            // provision()'s create-or-rotate: the DEFAULT name is
+            // ours by definition (so a stale/absent marker — e.g.
+            // schema-upgrade re-install — still rotates); an
+            // EXPLICIT `--sandbox-user` is create-only unless the
+            // marker records that name from a prior install.
+            let we_own_it =
+                sandbox_user.is_none() || existing.as_ref().is_some_and(|s| s.sandbox_user == name);
             let pu = match (|| -> anyhow::Result<srt_win::user::ProvisionedUser> {
-                use srt_win::{install, user};
-                let pu = user::provision().context("provision sandbox user")?;
+                let pu = user::provision(name, we_own_it).context("provision sandbox user")?;
                 install::write_setup(&pu)
                     .context("write sandbox credential + setup marker to state DB")?;
                 Ok(pu)
@@ -625,8 +661,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 "Sandbox user kept (--keep-user)."
             } else {
                 use srt_win::{install, user};
+                // Read the recorded name (may not be the default),
+                // then deprovision BEFORE clear_setup so a failed
+                // NetUserDel is retryable with the recorded name
+                // still intact. No marker (partial install that
+                // bailed before write_setup, or a stale/corrupt
+                // state DB) → fall back to the default name so
+                // SANDBOX_GROUP and any default-named account are
+                // still cleaned up; deprovision is idempotent on
+                // absent state.
+                let name = install::read_setup()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.sandbox_user)
+                    .unwrap_or_else(|| user::SANDBOX_USER.into());
+                user::deprovision(&name).context("deprovision sandbox user")?;
                 install::clear_setup().context("clear credential + setup marker")?;
-                user::deprovision().context("deprovision sandbox user")?;
                 "Sandbox user, credential, and setup marker removed."
             };
             // Migration: best-effort remove the legacy
@@ -641,8 +691,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub: UserCmd::Status,
         } => {
             use srt_win::{install, user};
-            let st = user::status()?;
             let setup = install::read_setup().ok().flatten();
+            let name = setup
+                .as_ref()
+                .map(|s| s.sandbox_user.as_str())
+                .unwrap_or(user::SANDBOX_USER);
+            let st = user::status(name)?;
             let ca = install::read_ca_cert()?;
             let ca = ca.as_ref();
             println!(

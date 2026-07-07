@@ -722,10 +722,16 @@ export interface WindowsInstallOptions {
    */
   proxyPortRange?: readonly [number, number]
   /**
+   * Name for the sandbox user account (created if absent, adopted
+   * if it already exists as a local user). Default `srt-sandbox`.
+   */
+  sandboxUser?: string
+  /**
    * Replace an existing install whose configuration differs
-   * (different port range under the same sublayer). Without this,
-   * install refuses with "already installed with different config"
-   * rather than silently overwriting.
+   * (different port range or sandbox-user name under the same
+   * sublayer). Without this, install refuses with "already
+   * installed with different config" rather than silently
+   * overwriting.
    */
   force?: boolean
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -776,6 +782,7 @@ export function installWindowsSandbox(
       `${opts.proxyPortRange[0]}-${opts.proxyPortRange[1]}`,
     )
   }
+  if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
 
   const r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
@@ -809,8 +816,9 @@ export function installWindowsSandbox(
     case 13:
       throw new Error(
         `srt-win install: filters already exist under this sublayer with ` +
-          `a different port range. Pass {force: true} to replace, or ` +
-          `pick a different sublayerGuid. Output: ${out}`,
+          `a different port range or sandbox-user name. Pass ` +
+          `{force: true} to replace, or pick a different sublayerGuid. ` +
+          `Output: ${out}`,
       )
     default:
       throw new Error(`srt-win install failed (exit ${r.status}): ${out}`)

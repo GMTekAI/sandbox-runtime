@@ -60,6 +60,10 @@ async function main(): Promise<void> {
       '--proxy-port-range <lo-hi>',
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
+    .option(
+      '--sandbox-user <name>',
+      'name for the sandbox user account (default: srt-sandbox)',
+    )
     .option('--force', 'replace an existing install with different config')
     .action(async (o: Record<string, string | boolean | undefined>) => {
       const { installWindowsSandbox } = await import(
@@ -73,6 +77,7 @@ async function main(): Promise<void> {
         const r = installWindowsSandbox({
           sublayerGuid: o.sublayerGuid as string | undefined,
           proxyPortRange: range,
+          sandboxUser: o.sandboxUser as string | undefined,
           force: Boolean(o.force),
         })
         if (r.cancelled) {
