@@ -1095,12 +1095,18 @@ describe.if(isWindows)(
       // never arrives; the nonce in its cmdline lets us find OUR
       // instance via CIM regardless of what else is on the runner.
       const nonce = `SrtKc${process.pid}x${Date.now()}`
+      // quiet:false — the seclogon-job note in logon.rs is the
+      // breadcrumb for the documented `AssignProcessToJobObject →
+      // ERROR_NOT_SUPPORTED` degrade path; without it a flake here
+      // has zero diagnostic.
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: `waitfor /t 30 ${nonce}`,
+        quiet: false,
       })
       const broker = spawn(argv[0], argv.slice(1), { env })
+      let stderr = ''
       broker.stdout?.on('data', () => {})
-      broker.stderr?.on('data', () => {})
+      broker.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
       const closed = new Promise<void>(r => broker.once('close', () => r()))
       const findChild = (): number | undefined => {
         const r = spawnSync(
@@ -1127,7 +1133,7 @@ describe.if(isWindows)(
         if (childPid === undefined) {
           throw new Error(
             `H-kill-chain: sandboxed waitfor.exe (${nonce}) never appeared ` +
-              `— broker.pid=${broker.pid}`,
+              `— broker.pid=${broker.pid} stderr=${JSON.stringify(stderr)}`,
           )
         }
         // Hard-kill the BROKER. The Job kill-chain (broker Job →
@@ -1157,7 +1163,8 @@ describe.if(isWindows)(
         }
         throw new Error(
           `H-kill-chain: sandboxed child pid=${childPid} survived ` +
-            `taskkill /F on broker(${broker.pid}) — Job kill-chain broken`,
+            `taskkill /F on broker(${broker.pid}) — Job kill-chain ` +
+            `broken. stderr=${JSON.stringify(stderr)}`,
         )
       } finally {
         // Belt-and-suspenders reap so a failure doesn't leak the

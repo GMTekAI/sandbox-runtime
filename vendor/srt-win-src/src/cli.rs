@@ -1110,18 +1110,23 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Share-lock current_exe() so a sandboxed child can't
             // rename/overwrite the broker binary mid-exec — see
             // `self_protect::share_lock_current_exe` for the threat
-            // model. Acquired BEFORE per-exec stamps so a stamp
-            // failure still had the lock held; released by
-            // process-exit handle cleanup. Warn-and-continue:
-            // defense-in-depth must not DoS the primary path when a
-            // third-party opener (AV/indexer/updater) holds DELETE
-            // access.
+            // model. Acquired BEFORE per-exec stamps: held for the
+            // duration of the stamp attempt; on stamp failure the
+            // child never launches so lock release on unwind is
+            // moot. Warn-and-continue: defense-in-depth must not
+            // DoS the primary path when a third-party opener
+            // (AV/indexer/updater) holds DELETE access. `--quiet`
+            // gates the warning — that failure mode is a persistent
+            // per-machine condition that would otherwise print on
+            // every exec.
             let _exe_lock = srt_win::self_protect::share_lock_current_exe()
                 .inspect_err(|e| {
-                    eprintln!(
-                        "srt-win: WARNING: share-lock current_exe: \
-                         {e:#} (proceeding; defense-in-depth only)"
-                    )
+                    if !quiet {
+                        eprintln!(
+                            "srt-win: WARNING: share-lock current_exe: \
+                             {e:#} (proceeding; defense-in-depth only)"
+                        )
+                    }
                 })
                 .ok();
 
