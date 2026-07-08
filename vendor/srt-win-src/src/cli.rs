@@ -211,6 +211,13 @@ enum Cmd {
         /// source) passes them here explicitly.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Suppress informational stderr (progress lines,
+        /// per-exec-deny summary, seclogon-job note). Actual
+        /// errors still print. The host sets this by default so
+        /// the sandboxed child's stderr is not polluted with
+        /// broker chatter.
+        #[arg(long)]
+        quiet: bool,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -422,6 +429,7 @@ fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
 struct PerExecRestore {
     holder: srt_win::state_db::HolderPid,
     sandbox_sid: String,
+    quiet: bool,
 }
 
 impl Drop for PerExecRestore {
@@ -433,7 +441,10 @@ impl Drop for PerExecRestore {
             Ok(((_, failed), _)) => (failed, None),
             Err(e) => (0, Some(e)),
         };
-        if failed > 0 {
+        // `failed > 0` is fail-closed (leftover ACEs are reaped by
+        // the next `acl` op) so it's informational; `err` is a real
+        // state-DB failure and prints regardless of `--quiet`.
+        if failed > 0 && !self.quiet {
             eprintln!(
                 "srt-win: WARNING: per-exec restore left {failed} \
                  path(s) stamped (fail-closed) — see prior \
@@ -779,6 +790,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                 },
+                false,
             )
             .context("spawn runner for egress probe")?;
             let probe = match code {
@@ -1071,6 +1083,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             deny_read,
             deny_write,
             env,
+            quiet,
             target,
         } => {
             use srt_win::install;
@@ -1093,6 +1106,21 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
+
+            // Share-lock current_exe(): open with FILE_SHARE_READ
+            // only (no SHARE_WRITE|SHARE_DELETE) so a sandboxed
+            // child can't rename/overwrite the broker binary
+            // mid-exec — closes the "sandboxed command overwrites
+            // the broker → next exec runs attacker binary" hole for
+            // standalone-`srt-win.exe` consumers under a `.`-granted
+            // cwd. Moot when the consumer sets `srtWin.path =
+            // process.execPath` (a running binary is already
+            // section-mapped so writes fail with
+            // ERROR_SHARING_VIOLATION), but standalone
+            // `vendor/srt-win.exe` needs it. Acquired BEFORE per-
+            // exec stamps so a stamp failure still had the lock
+            // held; released by process-exit handle cleanup.
+            let _exe_lock = share_lock_current_exe().context("share-lock current_exe")?;
 
             // No WFP pre-flight here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
@@ -1141,12 +1169,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let guard = PerExecRestore {
                     holder: own,
                     sandbox_sid: sb_sid.clone(),
+                    quiet,
                 };
-                eprintln!(
-                    "srt-win: per-exec deny (deny-ace): \
-                     holder_pid={} → {n} target(s)",
-                    own.0,
-                );
+                if !quiet {
+                    eprintln!(
+                        "srt-win: per-exec deny (deny-ace): \
+                         holder_pid={} → {n} target(s)",
+                        own.0,
+                    );
+                }
                 Some(guard)
             };
 
@@ -1157,7 +1188,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // it; non-elevated real-user siblings can still
             // query/debug the broker. Best-effort.
             let real_user = srt_win::sid::current_user_sid()?;
-            if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user)) {
+            if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user))
+                && !quiet
+            {
                 eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
             }
             // env_overlay = exactly what the caller passed via
@@ -1178,11 +1211,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                 })
                 .collect::<anyhow::Result<_>>()?;
-            eprintln!(
-                "srt-win: launching runner as '{}' (overlay={} var(s))",
-                cred.user,
-                env_overlay.len(),
-            );
+            if !quiet {
+                eprintln!(
+                    "srt-win: launching runner as '{}' (overlay={} var(s))",
+                    cred.user,
+                    env_overlay.len(),
+                );
+            }
             use srt_win::{logon, runner};
             let cwd = std::env::current_dir()
                 .ok()
@@ -1196,6 +1231,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     argv: target,
                     env_overlay,
                 }),
+                quiet,
             )?;
             // `cred` drops here → `SandboxCred::Drop` zeroes the
             // password. process::exit skips destructors, so the
@@ -1206,6 +1242,45 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Open `current_exe()` with `GENERIC_READ` + `FILE_SHARE_READ` only
+/// (no `FILE_SHARE_WRITE|FILE_SHARE_DELETE`) and return the handle.
+/// While held, any attempt to open the file for write/delete — and
+/// therefore rename-over/`MoveFileEx`/`SetFileInformationByHandle`
+/// (`FileRenameInfo`) onto it — fails with `ERROR_SHARING_VIOLATION`.
+/// See the `Cmd::Exec` call site for the threat model.
+fn share_lock_current_exe() -> anyhow::Result<srt_win::util::OwnedHandle> {
+    use anyhow::{Context, anyhow};
+    use srt_win::util::{OwnedHandle, pcwstr, wstr};
+    use windows::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    let exe = std::env::current_exe().context("current_exe")?;
+    let exe_s = exe
+        .to_str()
+        .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
+    let w = wstr(exe_s);
+    let h = unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    }
+    .with_context(|| format!("CreateFileW('{}', SHARE_READ-only)", exe.display()))?;
+    if h == INVALID_HANDLE_VALUE {
+        return Err(anyhow!(
+            "CreateFileW('{}'): INVALID_HANDLE_VALUE",
+            exe.display()
+        ));
+    }
+    Ok(OwnedHandle(h))
 }
 
 fn is_elevated() -> anyhow::Result<bool> {
@@ -1414,5 +1489,16 @@ mod tests {
         assert!(
             Cli::try_parse_from(["srt-win.exe", SRT_WIN_DISPATCH_ARG1, "user", "status",]).is_err()
         );
+    }
+
+    /// `--quiet` on `exec` parses and defaults false. Placement
+    /// before `--` (where the TS wrapper puts it) is accepted.
+    #[test]
+    fn exec_quiet_flag_parses() {
+        let with =
+            Cli::try_parse_from(["srt-win", "exec", "--quiet", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
+        let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 }
