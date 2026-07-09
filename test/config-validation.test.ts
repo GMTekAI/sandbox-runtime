@@ -739,6 +739,139 @@ describe('Config Validation', () => {
       }
     })
 
+    test('accepts a masked env var with an extract regex', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['db.example.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [
+            {
+              name: 'DATABASE_URL',
+              mode: 'mask',
+              extract: '://[^:]+:([^@]+)@',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects an env extract value that is not a valid regex', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['db.example.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [{ name: 'DATABASE_URL', mode: 'mask', extract: '(' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.envVars.0.extract',
+        )
+        expect(issue?.message).toContain('not a valid regular expression')
+      }
+    })
+
+    test('rejects an env extract regex with no capturing group', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['db.example.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [
+            { name: 'DATABASE_URL', mode: 'mask', extract: '://\\S+@' },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.envVars.0.extract',
+        )
+        expect(issue?.message).toContain('capturing group')
+      }
+    })
+
+    test('extract on a deny-mode env var is accepted (ignored)', () => {
+      // Mirrors the files precedent (and injectHosts-on-deny): harmless,
+      // so no error.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['db.example.com'], deniedDomains: [] },
+        credentials: {
+          envVars: [
+            { name: 'DATABASE_URL', mode: 'deny', extract: ':([^@]+)@' },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test.each(['warn', 'deny', 'error'] as const)(
+      'accepts onExtractNoMatch: "%s" on an env var',
+      onExtractNoMatch => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['db.example.com'],
+            deniedDomains: [],
+            tlsTerminate: {},
+          },
+          credentials: {
+            envVars: [
+              {
+                name: 'DATABASE_URL',
+                mode: 'mask',
+                extract: '://[^:]+:([^@]+)@',
+                onExtractNoMatch,
+              },
+            ],
+          },
+        })
+        expect(result.success).toBe(true)
+      },
+    )
+
+    test('rejects an invalid onExtractNoMatch value on an env var', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['db.example.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [
+            {
+              name: 'DATABASE_URL',
+              mode: 'mask',
+              extract: '://[^:]+:([^@]+)@',
+              onExtractNoMatch: 'ignore',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.envVars.0.onExtractNoMatch',
+        )
+        expect(issue).toBeDefined()
+      }
+    })
+
     test('rejects mode "mask" on a directory path (trailing slash)', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,

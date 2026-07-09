@@ -269,12 +269,63 @@ export const CredentialFileConfigSchema = z.object({
 
 /**
  * Schema for a single credential environment variable entry.
+ *
+ * `mode: "mask"` without `extract` is **whole-value** masking: the entire
+ * value is replaced inside the sandbox with one sentinel string, and the
+ * proxy substitutes that sentinel back to the real value on egress. This
+ * works for variables whose value *is* the credential (a bare token).
+ *
+ * `mode: "mask"` with `extract` is **structured** masking: the regex is
+ * applied globally to the real value, capture group 1 of each match is a
+ * credential value, and only those captured spans are replaced with
+ * sentinels — the rest of the value is preserved byte-for-byte. This lets
+ * a tool that parses the value (a `DATABASE_URL` connection string, a
+ * composite `KEY:SECRET` pair) still succeed inside the sandbox while the
+ * credential spans are protected. If the pattern matches nothing,
+ * behaviour is governed by `onExtractNoMatch` (default `"warn"` — the
+ * variable passes through unmasked and a stderr warning is emitted).
  */
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
   mode: credentialModeSchema.describe(
     'Access mode for this environment variable',
   ),
+  extract: extractPatternSchema
+    .optional()
+    .describe(
+      'Optional regex for structured masking. Applied globally; capture ' +
+        'group 1 of each match is masked, the rest of the value is ' +
+        'preserved. If the pattern matches nothing, behaviour is governed ' +
+        'by onExtractNoMatch (default "warn"). Only meaningful when mode ' +
+        'is "mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the value at runtime.
+   *
+   * - `"warn"` (default): emit a stderr warning and let the variable pass
+   *   through unmasked inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the variable when the credential
+   *   is legitimately absent from it.
+   * - `"deny"`: unset the variable inside the sandbox (fail-closed) — the
+   *   env analog of degrading a file to `mode: "deny"`. The operator
+   *   declared this variable as containing a credential; if the regex
+   *   cannot find it, withhold the value rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the regex.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` is set;
+   * accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing: "warn" (default — stderr ' +
+        'warning, variable passes through unmasked), "deny" (variable ' +
+        'unset inside the sandbox), or "error" (throw at wrap time). Only ' +
+        'meaningful with mode "mask" and extract set.',
+    ),
   injectHosts: z
     .array(domainPatternSchema)
     .optional()
