@@ -373,11 +373,19 @@ export const CredentialFileConfigSchema = z.object({
  * the unswapped fake ever reaches rejects it cryptographically. The proxy
  * swaps the whole fake token for the real one on egress.
  *
- * If the variable is set but its value does not verify as a JWT, nothing
- * was masked: the entry currently fails open — the real value stays in the
- * sandbox environment and a loud stderr warning names the variable. This
- * policy routing will unify with `onExtractNoMatch` when env-var extraction
- * lands.
+ * `decode: "jwt"` with `maskClaims` masks at the claim level instead: each
+ * named top-level payload claim present with a string value is replaced by
+ * its own sentinel and the token is rebuilt around the modified payload
+ * (original header segment, filler signature). All other claims stay real,
+ * so a client that decodes the token and reads a non-secret claim keeps
+ * working. The proxy substitutes both the whole rebuilt token (sent as a
+ * bearer credential) and each claim sentinel (extracted and sent alone).
+ *
+ * If the variable is set but its value does not verify as a JWT — or, with
+ * `maskClaims`, no named claim is present as a string — nothing was masked:
+ * the entry currently fails open — the real value stays in the sandbox
+ * environment and a loud stderr warning names the variable. This policy
+ * routing will unify with `onExtractNoMatch` when env-var extraction lands.
  */
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
@@ -395,6 +403,37 @@ export const CredentialEnvVarConfigSchema = z.object({
         'value does not verify, the variable is left unmasked with a ' +
         'stderr warning (fail-open). Only meaningful when mode is "mask"; ' +
         'accepted but ignored for "deny".',
+    ),
+  /**
+   * Names of top-level payload claims to mask inside the decoded value —
+   * the env-var counterpart of the `maskClaims` on a file entry: `decode`
+   * opens the variable's encoded value so masking can target a field
+   * inside the decoded payload instead of replacing the whole token.
+   *
+   * Every named claim present with a string value is replaced by its own
+   * sentinel and the token is rebuilt around the modified payload
+   * (original header segment, filler signature). All other claims are
+   * preserved verbatim, so a tool that decodes the token and reads a
+   * non-secret claim (issuer, audience, user id) keeps working while the
+   * secret claim is protected. A named claim that is absent or non-string
+   * is skipped. If no named claim matches, nothing was masked and the
+   * entry fails open with a stderr warning — same path as a value that
+   * does not verify as a JWT.
+   *
+   * Requires `decode` (there is no payload to look inside otherwise); an
+   * explicitly empty list is rejected — see the superRefine below.
+   */
+  maskClaims: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Names of top-level payload claims to mask inside the decoded ' +
+        'value, instead of replacing the whole token. Each named claim ' +
+        'present with a string value gets its own sentinel; all other ' +
+        'claims are preserved so claim-reading clients keep working. ' +
+        'Requires decode. If no named claim matches, the variable is left ' +
+        'unmasked with a stderr warning (fail-open). Only meaningful when ' +
+        'mode is "mask"; accepted but ignored for "deny".',
     ),
   injectHosts: z
     .array(domainPatternSchema)
@@ -882,6 +921,31 @@ export const SandboxRuntimeConfigSchema = z
     }
     for (const [idx, v] of (creds.envVars ?? []).entries()) {
       checkMaskedEntry(v, ['credentials', 'envVars', idx])
+      // maskClaims names fields inside a decoded payload; without decode
+      // there is no payload to look inside — reject the contradiction
+      // loudly rather than silently masking nothing.
+      if (v.maskClaims !== undefined && v.decode === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'maskClaims'],
+          message:
+            `maskClaims requires decode — it names claims inside the ` +
+            `decoded payload. Set decode (e.g. "jwt"), or remove ` +
+            `maskClaims to mask the whole value.`,
+        })
+      }
+      // Same posture as an explicitly empty injectHosts: "decode but mask
+      // no claims" is self-contradictory and almost certainly a mistake.
+      if (v.maskClaims !== undefined && v.maskClaims.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'maskClaims'],
+          message:
+            `maskClaims is explicitly empty — no claim would ever be ` +
+            `masked. Omit maskClaims to mask the whole token, or list ` +
+            `the claims to protect.`,
+        })
+      }
     }
     for (const [idx, f] of (creds.files ?? []).entries()) {
       checkMaskedEntry(f, ['credentials', 'files', idx])
