@@ -105,7 +105,12 @@ export class SentinelRegistry {
    * registered, the EXISTING sentinel is returned (and `sentinel` discarded)
    * so a re-register never invalidates a fake the sandboxed process has
    * already read. The caller must mint sentinels with enough entropy that
-   * collisions with real content are negligible (embed a uuid4).
+   * collisions with real content are negligible (embed a uuid4). No
+   * registered sentinel may be a substring of any other registered sentinel:
+   * the body-substitution scan matches earliest-position-then-registration-
+   * order, not longest-match, so nested sentinels would make replacement
+   * chunk-boundary-dependent (still fail-safe — worst case a wrong fake
+   * reaches upstream, never a secret).
    *
    * Caller-minted sentinels are used verbatim — never length-padded: a
    * shaped fake (e.g. a JWT) must keep its structure. They are therefore
