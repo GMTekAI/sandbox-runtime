@@ -31,6 +31,8 @@ import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
   normalizeRequestTarget,
+  requestTargetAsSpelled,
+  type DenyMark,
   applyHeaderEdits,
   notifyResponse,
   removeHeadersFolded,
@@ -287,6 +289,14 @@ export type TerminateTarget = {
   stripResponseHeaders?: string[]
   /** Answer 421 when the Host header or TLS server name is not the target. */
   requireHostMatch?: boolean
+  /** The largest request head parsed in the tunnel; past it, 400 (see HttpProxyServerOptions.maxHeaderSize). */
+  maxHeaderSize?: number
+  /** Drop hop-by-hop headers in any separator spelling (see HttpProxyServerOptions.foldHopByHop). */
+  foldHopByHop?: boolean
+  /** The header that marks the proxy's own refusals (see HttpProxyServerOptions.denyHeader). */
+  denyHeader?: string
+  /** Forward the request-target as spelled (see HttpProxyServerOptions.requestTargetAsSpelled). */
+  requestTargetAsSpelled?: boolean
   /** The TLS server name the client sent (set by terminateAndForward). */
   clientServerName?: string
   /** The ClientHello carries a server name that could not be read (see serverNameFromClientHello). */
@@ -330,7 +340,11 @@ export function terminateAndForward(
   // ClientHello is the tunnel's (read below, before the handshake).
   let serverName: ServerName = { kind: 'absent' }
   // Never listens: the TLS socket below is handed to it.
-  const inner = createHttpServer()
+  const inner = createHttpServer(
+    target.maxHeaderSize !== undefined
+      ? { maxHeaderSize: target.maxHeaderSize }
+      : {},
+  )
 
   // Needs an http.Server that serves a connection handed to it (Node, Bun
   // 1.4 and later: such a server has a 'connection' listener of its own).
@@ -392,6 +406,25 @@ export function terminateAndForward(
       `[tls-terminate] client connection error for ${target.hostname}: ${err.message}`,
       { level: 'error' },
     )
+    if (
+      target.maxHeaderSize !== undefined &&
+      (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' &&
+      sock.writable
+    ) {
+      // A head past the caller's own limit is a request past its limits:
+      // 400, flushed before the socket goes.
+      sock.on('error', () => {})
+      const mark =
+        target.denyHeader !== undefined
+          ? `${target.denyHeader}: bad_request\r\n`
+          : ''
+      sock.end(
+        `HTTP/1.1 400 Bad Request\r\n${mark}Content-Length: 0\r\nConnection: close\r\n\r\n`,
+        () => sock.destroy(),
+      )
+      setTimeout(() => sock.destroy(), 1000).unref?.()
+      return
+    }
     sock.destroy()
   })
   inner.on('upgrade', (_req, sock) => {
@@ -797,13 +830,13 @@ function forwardUpstreamGuarded(
   // must not become an unhandledRejection, and the client still gets an
   // answer (502, or a reset once headers are out) instead of waiting for
   // a server timeout.
-  const [, , , req, res] = args
+  const [, , , req, res, target] = args
   forwardUpstream(...args).catch(err => {
     logForDebugging(
       `[tls-terminate] forwardUpstream failed: ${(err as Error).message}`,
       { level: 'error' },
     )
-    respondUpstreamError(res, err as Error)
+    respondUpstreamError(res, err as Error, target.denyHeader)
     destroyAfterDenial(req, res)
   })
 }
@@ -832,12 +865,19 @@ async function forwardUpstream(
   // exactly what is sent. A target of any other shape could make the judged
   // URL name another host, so it is refused. Without filterRequest nothing
   // judges the path, so the target is forwarded unchanged (and a masked AWS
-  // credential is re-signed over those same bytes).
-  const path = filterRequest
-    ? normalizeRequestTarget(req.url ?? '/', req.method)
-    : originFormPath(req.url)
+  // credential is re-signed over those same bytes). requestTargetAsSpelled
+  // comes first: it forwards the target as the client spelled it.
+  const markFor = (code: string): DenyMark | undefined =>
+    target.denyHeader !== undefined
+      ? { name: target.denyHeader, value: code }
+      : undefined
+  const path = target.requestTargetAsSpelled
+    ? requestTargetAsSpelled(req.url ?? '/')
+    : filterRequest
+      ? normalizeRequestTarget(req.url ?? '/', req.method)
+      : originFormPath(req.url)
   if (path === undefined) {
-    respondDenied(res, 'malformed request-target', undefined, 400)
+    respondDenied(res, 'malformed request-target', markFor('bad_request'), 400)
     return
   }
   // RFC 9112 3.2: an HTTP/1.1 request without Host is answered 400. Not
@@ -847,7 +887,12 @@ async function forwardUpstream(
     req.httpVersion === '1.1' &&
     hostHeaderValues(req.rawHeaders).length === 0
   ) {
-    respondDenied(res, 'HTTP/1.1 request without a Host header', undefined, 400)
+    respondDenied(
+      res,
+      'HTTP/1.1 request without a Host header',
+      markFor('bad_request'),
+      400,
+    )
     return
   }
   // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
@@ -862,7 +907,7 @@ async function forwardUpstream(
       `https://${authority}${path}`,
       why,
     )
-    respondDenied(res, why, undefined, 421)
+    respondDenied(res, why, markFor('misdirected'), 421)
     return
   }
   if (target.requireHostMatch) {
@@ -878,7 +923,7 @@ async function forwardUpstream(
         `https://${authority}${path}`,
         why,
       )
-      respondDenied(res, why, undefined, 421)
+      respondDenied(res, why, markFor('misdirected'), 421)
       return
     }
   }
@@ -914,6 +959,7 @@ async function forwardUpstream(
         rawHeaders: [...req.rawHeaders],
         scheme: 'https',
       },
+      target.denyHeader,
     )
     if (out === null) return
     body = out.body
@@ -938,7 +984,9 @@ async function forwardUpstream(
   // The upstream is dialed by vetted address (below), so Host and SNI are
   // what carry the name: rebuild Host from the tunnel's target — the name the
   // allowlist saw — rather than forwarding the client's spelling.
-  const fwdHeaders = stripHopByHop(req.headers)
+  const fwdHeaders = stripHopByHop(req.headers, {
+    folded: target.foldHopByHop,
+  })
   fwdHeaders.host = authority
   // The decision's edits go before the credential hooks below, so a value
   // a decision sets can itself carry a masked credential's sentinel.
@@ -1075,7 +1123,7 @@ async function forwardUpstream(
       req.socket.destroy()
       return
     }
-    respondUpstreamError(res, err)
+    respondUpstreamError(res, err, target.denyHeader)
   }
   // Vet and pick the upstream address first (see createUpstreamLeg); the
   // name stays in Host and SNI.

@@ -33,6 +33,12 @@ export type RequestDecision = {
    */
   status?: number
   /**
+   * Deny only: a short reason code for the refusal (an HTTP token, e.g.
+   * `decider`). A proxy created with `denyHeader` sends it as that
+   * header's value; `denied` when none is given. Otherwise it is unused.
+   */
+  mark?: string
+  /**
    * Allow only: headers to remove from the forwarded request. Names match
    * case-insensitively and with `-`, `_` and `.` treated as one character,
    * so `x-api-key` also removes `X_Api_Key` and `x.api.key`. Framing headers
@@ -92,6 +98,14 @@ export type RequestInfo = {
   scheme?: 'http' | 'https'
   /** The TLS server name the client sent, on the TLS-terminated path. */
   sni?: string
+  /**
+   * Set only for GET, HEAD and OPTIONS requests that declare a body, whose
+   * Request is built without one: resolves true once the request is known
+   * to carry body bytes (a non-zero Content-Length, or the first decoded
+   * byte of a chunked body) and false when the body ends empty. A callback
+   * that needs to have seen the whole request must refuse when it is true.
+   */
+  unshownBody?: () => Promise<boolean>
   /**
    * Where the request goes: the CONNECT target on the TLS-terminated
    * path, or the absolute URI's host and port on the plain path, in the
@@ -182,6 +196,7 @@ export async function decideAndRespond(
   signal: AbortSignal,
   onDeny?: (method: string, url: string, reason: string) => void,
   info?: RequestInfo,
+  denyHeader?: string,
   canSetHeaders = true,
 ): Promise<{ body: Readable; decision: RequestDecision } | null> {
   const method = req.method ?? 'GET'
@@ -239,7 +254,11 @@ export async function decideAndRespond(
   if (ECHO_METHODS.has(method.toUpperCase())) {
     const reason = `the ${method} method is not forwarded`
     onDeny?.(method, url, reason)
-    deny(res, { action: 'deny', status: 405, reason })
+    deny(
+      res,
+      { action: 'deny', status: 405, reason, mark: 'method_refused' },
+      denyHeader,
+    )
     forCallback?.cancel().catch(() => {})
     endDeniedBody(req, res, forUpstream, shim)
     return null
@@ -264,7 +283,7 @@ export async function decideAndRespond(
     // Malformed URL/headers from the client — deny rather than crash.
     const reason = `malformed request: ${(err as Error).message}`
     onDeny?.(method, url, reason)
-    deny(res, { action: 'deny', reason })
+    deny(res, { action: 'deny', reason, mark: 'bad_request' }, denyHeader)
     forCallback?.cancel().catch(() => {})
     endDeniedBody(req, res, forUpstream, shim)
     return null
@@ -272,7 +291,12 @@ export async function decideAndRespond(
 
   let decision: RequestDecision
   try {
-    decision = await filterRequest(webReq, info)
+    decision = await filterRequest(
+      webReq,
+      forCallback && bodylessMethod
+        ? { ...info, unshownBody: unshownBodyProbe(req, forCallback) }
+        : info,
+    )
   } catch (err) {
     decision = {
       action: 'deny',
@@ -294,7 +318,11 @@ export async function decideAndRespond(
     decision.action === 'allow' &&
     (decision.setHeaders?.length ?? 0) > 0
   ) {
-    decision = { action: 'deny', reason: PLAINTEXT_HEADER_SET_REASON }
+    decision = {
+      action: 'deny',
+      reason: PLAINTEXT_HEADER_SET_REASON,
+      mark: 'plaintext_header_set',
+    }
   }
 
   // If the callback didn't read its branch, cancel it so tee() stops
@@ -312,7 +340,7 @@ export async function decideAndRespond(
   }
 
   onDeny?.(method, url, decision.reason ?? DEFAULT_DENY_REASON)
-  deny(res, decision)
+  deny(res, decision, denyHeader)
   endDeniedBody(req, res, forUpstream, shim)
   return null
 }
@@ -345,9 +373,41 @@ function endDeniedBody(
   destroyAfterResponse(req, res)
 }
 
+/**
+ * Whether a request whose body the callback's Request leaves out carries
+ * any body bytes. A non-zero Content-Length answers at once; otherwise the
+ * callback's branch of the tee is read, which holds decoded body bytes, so
+ * empty reads are skipped and only the end of the body means "none".
+ */
+function unshownBodyProbe(
+  req: IncomingMessage,
+  branch: ReadableStream<Uint8Array>,
+): () => Promise<boolean> {
+  let answer: Promise<boolean> | undefined
+  const probe = async (): Promise<boolean> => {
+    if (
+      !req.headers['transfer-encoding'] &&
+      Number(req.headers['content-length']) > 0
+    ) {
+      return true
+    }
+    const reader = branch.getReader()
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return false
+        if (value.byteLength > 0) return true
+      }
+    } finally {
+      reader.cancel().catch(() => {})
+    }
+  }
+  return () => (answer ??= probe())
+}
+
 const PLAINTEXT_HEADER_SET_REASON =
-  'filterRequest decision sets headers, which are not applied to plain-HTTP ' +
-  'requests unless plaintext header sets are enabled'
+  'the allow decision sets headers, and headers are not set on plain-HTTP ' +
+  'requests unless plaintext header sets are enabled; nothing was forwarded'
 
 // RFC 9110 token; the same set Node's own header-name check accepts.
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
@@ -366,6 +426,12 @@ function malformedDecisionReason(decision: unknown): string | undefined {
   }
   if (d.status !== undefined && typeof d.status !== 'number') {
     return 'status is not a number'
+  }
+  if (
+    d.mark !== undefined &&
+    (typeof d.mark !== 'string' || !HEADER_NAME.test(d.mark))
+  ) {
+    return 'mark is not a reason code'
   }
   if (d.action === 'deny') return undefined
   if (d.onResponse !== undefined && typeof d.onResponse !== 'function') {
@@ -413,11 +479,22 @@ function isValidHeaderValue(value: string): boolean {
   return true
 }
 
-function deny(res: ServerResponse, decision: RequestDecision): void {
+function deny(
+  res: ServerResponse,
+  decision: RequestDecision,
+  denyHeader: string | undefined,
+): void {
   const s = decision.status
   const status =
     s !== undefined && Number.isInteger(s) && s >= 400 && s <= 599 ? s : 403
-  respondDenied(res, decision.reason ?? DEFAULT_DENY_REASON, undefined, status)
+  respondDenied(
+    res,
+    decision.reason ?? DEFAULT_DENY_REASON,
+    denyHeader !== undefined
+      ? { name: denyHeader, value: decision.mark ?? 'denied' }
+      : undefined,
+    status,
+  )
 }
 
 /**
@@ -444,6 +521,36 @@ export function normalizeRequestTarget(
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
   return `${url.pathname.replace(/^\/{2,}/, '/')}${url.search}`
+}
+
+/**
+ * A request-target as the client spelled it, for a proxy that forwards it
+ * unchanged and lets its policy match it exactly: dot segments and
+ * percent-escapes, encoded or not, are kept, so an unusual spelling of an
+ * admitted path is simply not that path. Origin form only (`/` first, and
+ * not `//` or `/\`), with no `#`, space, control byte or DEL; with
+ * `absolute`, the path and query of an absolute http(s) URI, as spelled.
+ * Any other shape (authority form, asterisk form, or absolute form where
+ * origin form is required) is undefined, which the caller answers 400.
+ */
+export function requestTargetAsSpelled(
+  raw: string,
+  { absolute = false }: { absolute?: boolean } = {},
+): string | undefined {
+  let target = raw
+  if (absolute) {
+    const m = /^https?:\/\/[^/?#]*/i.exec(raw)
+    if (!m) return undefined
+    target = raw.slice(m[0].length)
+    if (target === '' || target.startsWith('?')) target = '/' + target
+  }
+  if (!target.startsWith('/') || target.startsWith('//')) return undefined
+  if (target.startsWith('/\\')) return undefined
+  for (let i = 0; i < target.length; i++) {
+    const c = target.charCodeAt(i)
+    if (c <= 0x20 || c === 0x7f || c === 0x23) return undefined
+  }
+  return target
 }
 
 /**
@@ -640,11 +747,27 @@ const DEFAULT_DENY_TAG = 'blocked-by-sandbox-runtime'
  * answer on a bare socket (CONNECT): 403 with an `X-Proxy-Error` tag and
  * the reason as the body.
  */
-export function rawDenied(reason: string, tag = DEFAULT_DENY_TAG): string {
+/**
+ * The header that marks a denial: `X-Proxy-Error: <tag>` for a tag, or a
+ * caller's own header and value.
+ */
+export type DenyMark = string | { name: string; value: string }
+
+function denyMarkHeader(mark: DenyMark): [string, string] {
+  return typeof mark === 'string'
+    ? ['X-Proxy-Error', mark]
+    : [mark.name, mark.value]
+}
+
+export function rawDenied(
+  reason: string,
+  tag: DenyMark = DEFAULT_DENY_TAG,
+): string {
+  const [name, value] = denyMarkHeader(tag)
   return (
     'HTTP/1.1 403 Forbidden\r\n' +
     'Content-Type: text/plain\r\n' +
-    `X-Proxy-Error: ${tag}\r\n` +
+    `${name}: ${value}\r\n` +
     '\r\n' +
     reason
   )
@@ -659,7 +782,7 @@ export function rawDenied(reason: string, tag = DEFAULT_DENY_TAG): string {
 export function respondDenied(
   res: ServerResponse,
   reason: string,
-  tag = DEFAULT_DENY_TAG,
+  tag: DenyMark = DEFAULT_DENY_TAG,
   status = 403,
 ): void {
   logForDebugging(`[proxy] deny: ${reason}`)
@@ -667,9 +790,10 @@ export function respondDenied(
     res.destroy()
     return
   }
+  const [name, value] = denyMarkHeader(tag)
   res.writeHead(status, {
     'Content-Type': 'text/plain',
-    'X-Proxy-Error': tag,
+    [name]: value,
   })
   res.end(reason + '\n')
 }
@@ -679,9 +803,19 @@ export function respondDenied(
  * denial (403 with the reason); anything else is a 502, or a bare destroy
  * once headers are out.
  */
-export function respondUpstreamError(res: ServerResponse, err: Error): void {
+export function respondUpstreamError(
+  res: ServerResponse,
+  err: Error,
+  denyHeader?: string,
+): void {
   if (isResolvedAddressDenied(err)) {
-    respondDenied(res, err.message)
+    respondDenied(
+      res,
+      err.message,
+      denyHeader !== undefined
+        ? { name: denyHeader, value: 'address_not_allowed' }
+        : undefined,
+    )
   } else if (!res.headersSent) {
     res.writeHead(502, { 'Content-Type': 'text/plain' })
     res.end('Bad Gateway')

@@ -220,6 +220,10 @@ srt --control-fd 3 -- npm test
   points that slot at `/dev/null` for the command, so nothing inside the
   sandbox can read the updates or write a config of its own.
 
+### As a standalone proxy with an external decider: `srt proxy`
+
+`srt proxy` (or the single-file `srt-proxy` executable built by `bun run build:srt-proxy`) runs only SRT's HTTP proxy, with no sandboxed child, for a host that runs the workload elsewhere. It accepts on a listening socket the host hands in, terminates every CONNECT in-process, and forwards a request only when a separate decider process, reached over another inherited descriptor, allows it. See [docs/srt-proxy.md](docs/srt-proxy.md) for the command line, the decider protocol and the security model.
+
 ### As a library
 
 ```typescript

@@ -415,20 +415,29 @@ export function relayResponseHead(
 /**
  * Strip hop-by-hop and proxy-specific headers before forwarding upstream.
  * Also strips any headers named in the incoming `Connection` header, per
- * RFC 7230 §6.1.
+ * RFC 9110 §7.6.1. With `folded`, a name also matches in any spelling of
+ * `-`, `_` and `.` (`Proxy_Authorization`, `keep.alive`), for upstreams
+ * that read those separators as one.
  */
-export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+export function stripHopByHop(
+  h: IncomingHttpHeaders,
+  { folded = false }: { folded?: boolean } = {},
+): IncomingHttpHeaders {
+  const norm = (name: string): string => {
+    const lower = name.trim().toLowerCase()
+    return folded ? lower.replace(/[_.]/g, '-') : lower
+  }
   const extra = new Set<string>()
   const connHeader = h.connection
   if (connHeader) {
     for (const tok of String(connHeader).split(',')) {
-      extra.add(tok.trim().toLowerCase())
+      extra.add(norm(tok))
     }
   }
   const out: IncomingHttpHeaders = {}
   for (const [k, v] of Object.entries(h)) {
-    const lk = k.toLowerCase()
-    if (!HOP_BY_HOP.has(lk) && !extra.has(lk)) out[k] = v
+    const nk = norm(k)
+    if (!HOP_BY_HOP.has(nk) && !extra.has(nk)) out[k] = v
   }
   return out
 }
