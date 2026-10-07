@@ -378,18 +378,19 @@ export function proxyAuthHeader(proxyUrl: URL): string | undefined {
  * `502 Bad Gateway` instead: nothing from the upstream head or body is
  * relayed, and the upstream connection is closed.
  *
+ * `headers` is what to send in place of the upstream's own headers with the
+ * hop-by-hop ones removed, for a caller that has filtered them further.
+ *
  * Returns true when the head was written and the body should be piped,
  * false when the response was replaced by the 502.
  */
 export function relayResponseHead(
   res: ServerResponse,
   upstreamRes: IncomingMessage,
+  headers: IncomingHttpHeaders = stripHopByHop(upstreamRes.headers),
 ): boolean {
   try {
-    res.writeHead(
-      upstreamRes.statusCode ?? 502,
-      stripHopByHop(upstreamRes.headers),
-    )
+    res.writeHead(upstreamRes.statusCode ?? 502, headers)
     return true
   } catch (err) {
     logForDebugging(

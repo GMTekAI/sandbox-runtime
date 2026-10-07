@@ -837,11 +837,52 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'Per-request filter callback. Receives the parsed HTTP request ' +
-        '(web-standard Request) and returns {action, reason?}. Denied ' +
-        'requests get a 403 with the reason. If the callback throws, the ' +
+        '(web-standard Request) and request details, and returns {action, ' +
+        'reason?, status?} or, for an allow, header edits (removeHeaders, ' +
+        'setHeaders) and an onResponse observer. Denied requests get the ' +
+        'status (403 by default) with the reason. If the callback throws, the ' +
         'request is denied. Applies to plain HTTP through the proxy and, ' +
         'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
-        'provide a policy language; library consumers own matching.',
+        'provide a policy language; library consumers own matching. This and ' +
+        'the four options after it are read when the proxy starts; ' +
+        'updateConfig does not change them.',
+    ),
+  allowPlaintextHeaderSet: z
+    .boolean()
+    .optional()
+    .describe(
+      'Let a filterRequest allow set headers on plain-HTTP requests. Off by ' +
+        'default: a header set there travels in cleartext, so while it is off ' +
+        'an allow that carries setHeaders is refused with 403 for every ' +
+        'request the proxy receives in cleartext, an absolute https:// URI ' +
+        'included. An allow without setHeaders is unaffected and removals ' +
+        'always apply.',
+    ),
+  stripResponseHeaders: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Response headers never passed back to the sandboxed client, matched ' +
+        'case-insensitively with "-", "_" and "." folded (e.g. ["set-cookie"]).',
+    ),
+  refuseOpaqueTunnels: z
+    .boolean()
+    .optional()
+    .describe(
+      'Refuse every tunnel filterRequest cannot see into: an HTTP CONNECT ' +
+        'that would not be TLS-terminated or carries no TLS, and every SOCKS ' +
+        'CONNECT (refused at the handshake). Requires tlsTerminate to serve ' +
+        'HTTPS at all, and stops CONNECT-carried SSH such as GIT_SSH_COMMAND ' +
+        'through the proxy. Refusals are recorded as violations.',
+    ),
+  requireHostMatch: z
+    .boolean()
+    .optional()
+    .describe(
+      'Answer 421 to a request whose Host header, TLS server name or ' +
+        'absolute-form authority does not name the host and port it is sent ' +
+        'to, before filterRequest is asked. Refusals are recorded as ' +
+        'violations.',
     ),
   tlsTerminate: z
     .object({

@@ -1414,6 +1414,10 @@ async function curlViaProxy(
     '-sS',
     '--proxy',
     `http://${auth}127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--max-time',
     '10',
     '-D',

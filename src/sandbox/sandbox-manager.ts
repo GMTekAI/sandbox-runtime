@@ -573,6 +573,10 @@ async function startMuxProxyServer(
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
+    plaintextHeaderSet: config?.network.allowPlaintextHeaderSet,
+    stripResponseHeaders: config?.network.stripResponseHeaders,
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    requireHostMatch: config?.network.requireHostMatch,
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
       recordProxyViolation(
         `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
@@ -604,6 +608,15 @@ async function startMuxProxyServer(
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
+    // A SOCKS tunnel is opaque, so the option that keeps opaque CONNECT
+    // tunnels off the HTTP side must close this side of the port too.
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    onTunnelRefused: (port, host, encodedCommand) => {
+      recordProxyViolation(
+        `deny socks-tunnel ${host}:${port} (refuseOpaqueTunnels)`,
+        encodedCommand,
+      )
+    },
     probeUnauthenticated: async (port, host) => {
       // Explicit deny rules only: an unauthenticated peer must never reach
       // the ask callback, and a merely off-list host gets the generic

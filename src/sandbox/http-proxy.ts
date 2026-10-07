@@ -11,6 +11,13 @@ import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  normalizeRequestTarget,
+  applyHeaderEdits,
+  notifyResponse,
+  removeHeadersFolded,
+  hostHeaderValues,
+  hostMismatch,
+  type RequestDecision,
   rawDenied,
   respondDenied,
   respondUpstreamError,
@@ -109,6 +116,13 @@ export interface HttpProxyServerOptions {
   /**
    * Per-request filter; runs on plain-HTTP proxy requests and on terminated
    * HTTPS requests. See request-filter.ts.
+   *
+   * With `filterRequest`, the request target is normalised before the hook
+   * sees it and that normalised target is what is forwarded. Without it,
+   * the target is forwarded as it was before the hook existed: on plain
+   * HTTP that is the URL-parsed path and query (so `/a/../b` still goes
+   * out as `/b`), and on the TLS-terminated path it is the client's bytes
+   * unchanged.
    */
   filterRequest?: FilterRequestCallback
 
@@ -208,6 +222,45 @@ export interface HttpProxyServerOptions {
    * specific command.
    */
   proxyAuthToken?: string
+
+  /**
+   * Whether a filterRequest allow may SET headers on a plain-HTTP request.
+   * Off by default: a header set there (a credential, say) would travel in
+   * cleartext. While off, an allow that carries `setHeaders` is refused with
+   * 403 and nothing is forwarded; an allow without sets is unaffected, and
+   * removals always apply.
+   */
+  plaintextHeaderSet?: boolean
+
+  /**
+   * Response headers removed before a response is written to the client,
+   * on both paths, matched as removeHeaders matches (case and `-` `_` `.`
+   * folded). E.g. ['set-cookie', 'set-cookie2'] keeps upstream cookies
+   * from the client.
+   */
+  stripResponseHeaders?: string[]
+
+  /**
+   * When true, a CONNECT is served only by in-process TLS termination: a
+   * CONNECT whose first bytes are not a TLS ClientHello is closed, and one
+   * that would not be terminated at all (no mitmCA, or shouldTerminateTLS
+   * says no) is refused with 403, instead of either being tunnelled
+   * opaquely past filterRequest. Each refusal is reported through
+   * onFilterRequestDenied with method CONNECT. Use it when every request
+   * must be seen by filterRequest; the SOCKS side of the same port needs
+   * SocksProxyServerOptions.refuseOpaqueTunnels too. CONNECT-carried SSH
+   * (e.g. a GIT_SSH_COMMAND through this proxy) stops working.
+   */
+  refuseOpaqueTunnels?: boolean
+
+  /**
+   * When true, a request whose Host header (or, on the TLS-terminated path,
+   * whose TLS server name or absolute-form authority) does not name the
+   * host and port it is being sent to is answered 421 Misdirected Request
+   * before filterRequest is asked, and reported through
+   * onFilterRequestDenied. See hostMismatch for the accepted shapes.
+   */
+  requireHostMatch?: boolean
 }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
@@ -515,6 +568,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               port,
               upstreamCA: options.tlsTerminateUpstreamCA,
               lookup,
+              stripResponseHeaders: options.stripResponseHeaders,
+              requireHostMatch: options.requireHostMatch,
               onFilterRequestDeny: options.onFilterRequestDenied
                 ? (method, url, reason) =>
                     options.onFilterRequestDenied!({
@@ -530,10 +585,33 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           )
           return
         }
+        if (options.refuseOpaqueTunnels) {
+          logForDebugging(
+            `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; refused (refuseOpaqueTunnels)`,
+          )
+          options.onFilterRequestDenied?.({
+            method: 'CONNECT',
+            url: formatAuthority(hostname, port, 0),
+            reason: 'tunnel carries no TLS and cannot be inspected',
+            encodedCommand: auth.encodedCommand,
+          })
+          socket.destroy()
+          return
+        }
         logForDebugging(
           `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; opaque-tunnelling`,
         )
         head = peeked.head
+      } else if (options.refuseOpaqueTunnels) {
+        const reason = 'this proxy does not tunnel CONNECTs it cannot inspect'
+        options.onFilterRequestDenied?.({
+          method: 'CONNECT',
+          url: formatAuthority(hostname, port, 0),
+          reason,
+          encodedCommand: auth.encodedCommand,
+        })
+        endWithStatus(rawDenied(reason))
+        return
       } else if (options.mitmCA) {
         // Per-host termination opt-out: the policy exempts this host (mTLS
         // upstream, cert-pinning client), so skip the MITM entirely and
@@ -716,15 +794,6 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const authority = formatAuthority(hostname, port, defaultPort)
 
       const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
-      options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
-      // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
-      // the same config gate). May delete content-length from fwdHeaders.
-      const bodyTransform = prepareBodySubstitution(
-        options.getBodySubstitutionsPlaintext,
-        req,
-        fwdHeaders,
-        hostname,
-      )
 
       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
@@ -741,11 +810,39 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      const absUrl = `${url.protocol}//${authority}${url.pathname}${url.search}`
+      // With filterRequest, the request target is normalized before the
+      // hook sees it and that normalized target is what is forwarded;
+      // without it, the parsed path and query are forwarded unchanged.
+      const requestTarget = options.filterRequest
+        ? normalizeRequestTarget(req.url!, req.method)
+        : `${url.pathname}${url.search}`
+      if (requestTarget === undefined) {
+        respondDenied(res, 'malformed request-target', undefined, 400)
+        return
+      }
+      const absUrl = `${url.protocol}//${authority}${requestTarget}`
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.
       let body: Readable = req
+      let decision: RequestDecision | undefined
+      if (options.requireHostMatch) {
+        const why = hostMismatch(hostHeaderValues(req.rawHeaders), undefined, {
+          hostname,
+          port,
+          defaultPort,
+        })
+        if (why !== undefined) {
+          options.onFilterRequestDenied?.({
+            method: req.method ?? 'GET',
+            url: absUrl,
+            reason: why,
+            encodedCommand: auth.encodedCommand,
+          })
+          respondDenied(res, why, undefined, 421)
+          return
+        }
+      }
       if (options.filterRequest) {
         const ac = new AbortController()
         res.once('close', () => ac.abort())
@@ -764,9 +861,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
                   encodedCommand: auth.encodedCommand,
                 })
             : undefined,
+          {
+            target: { host: hostname, port },
+            requestTarget,
+            rawHeaders: [...req.rawHeaders],
+            scheme: 'http',
+          },
+          options.plaintextHeaderSet === true,
         )
         if (out === null) return
-        body = out
+        body = out.body
+        decision = out.decision
+        applyHeaderEdits(fwdHeaders, out.decision)
         // The client may have aborted during the filterRequest await —
         // the tee branch is already destroyed and res 'close' has already
         // fired, so the teardown listeners attached below would never
@@ -783,6 +889,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           return
         }
       }
+
+      // Credential substitution runs after the decision's header edits, as
+      // on the TLS-terminated path, so a set value can carry a sentinel.
+      options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
+      // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
+      // the same config gate). May delete content-length from fwdHeaders.
+      const bodyTransform = prepareBodySubstitution(
+        options.getBodySubstitutionsPlaintext,
+        req,
+        fwdHeaders,
+        hostname,
+      )
 
       // When the client declared a body but the forwarded headers carry no
       // framing (chunked TE stripped as hop-by-hop, or a body transform
@@ -833,7 +951,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       } else if (parentUrl) {
@@ -863,7 +986,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       } else {
@@ -889,7 +1017,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         proxyReq = (isHttps ? httpsRequest : httpRequest)(
           {
             ...direct,
-            path: url.pathname + url.search,
+            path: requestTarget,
             method: req.method,
             headers: fwdHeaders,
           },
@@ -903,7 +1031,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       }

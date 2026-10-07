@@ -353,6 +353,10 @@ async function curl(
     '-sS',
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--cacert',
     CA_CERT,
     '--max-time',

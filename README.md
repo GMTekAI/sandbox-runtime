@@ -386,6 +386,17 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
 }
 ```
 
+**Request rewriting** (with `network.filterRequest`, set by library consumers): an allow decision may also carry header edits (`removeHeaders`, `setHeaders`) and an `onResponse` observer, and a deny decision may choose its status (403 by default). These options are read when the proxy starts; `updateConfig` does not change them.
+
+- `network.allowPlaintextHeaderSet` - Let an allow decision set headers on plain-HTTP requests. Off by default: a header set there would travel in cleartext, so while it is off an allow decision that carries `setHeaders` is refused with 403, and nothing is forwarded, for every request the proxy receives in cleartext (an absolute `https://` URI included). An allow without `setHeaders` is unaffected and removals always apply. The callback's second argument reports `scheme: 'http'` for these requests.
+- `network.stripResponseHeaders` - Response headers never passed back to the sandboxed client, matched case-insensitively with `-`, `_` and `.` folded (e.g. `["set-cookie"]`).
+- `network.refuseOpaqueTunnels` - Refuse every tunnel `filterRequest` cannot see into: an HTTP CONNECT that would not be TLS-terminated or carries no TLS, and every SOCKS CONNECT. Requires `tlsTerminate` to serve HTTPS at all, and stops CONNECT-carried SSH (such as `GIT_SSH_COMMAND`) through the proxy. Refusals are recorded as violations.
+- `network.requireHostMatch` - Answer 421 to a request whose Host header, TLS server name or absolute-form authority does not name the host and port it is sent to, before `filterRequest` is asked. Refusals are recorded as violations.
+
+While `filterRequest` is set, the request target is normalised once (dot segments and `%2e` resolved, a run of leading slashes collapsed to one), and that value is both what the callback sees and what is forwarded, on plain HTTP and inside a terminated tunnel. A target that is not origin form, an absolute `http(s)` URI, or `*` for `OPTIONS` is answered 400.
+
+While `filterRequest` is set, `TRACE` and `TRACK` requests are answered 405 before it is asked, on plain HTTP and inside a terminated tunnel, because their response would echo a header the decision set back to the client. Node's and Bun 1.4's HTTP parsers already answer `TRACK` 400 before the proxy sees it; under Bun 1.3 the connection is closed without an answer. Refusals are recorded as violations.
+
 **Unix Socket Settings** (platform-specific behavior):
 
 | Setting                        | macOS                     | Linux                                    |

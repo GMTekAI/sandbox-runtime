@@ -26,6 +26,13 @@ import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  normalizeRequestTarget,
+  applyHeaderEdits,
+  notifyResponse,
+  removeHeadersFolded,
+  hostHeaderValues,
+  hostMismatch,
+  type RequestDecision,
   respondDenied,
   respondUpstreamError,
   type FilterRequestCallback,
@@ -172,6 +179,12 @@ export type TerminateTarget = {
    * it without an extra parameter on every layer.
    */
   onFilterRequestDeny?: (method: string, url: string, reason: string) => void
+  /** Response headers removed before the response reaches the client. */
+  stripResponseHeaders?: string[]
+  /** Answer 421 when the Host header or TLS server name is not the target. */
+  requireHostMatch?: boolean
+  /** The TLS server name the client sent (set by terminateAndForward). */
+  clientServerName?: string
 }
 
 /**
@@ -206,11 +219,16 @@ export function terminateAndForward(
   // parser; clients negotiate down. The base secureContext covers clients
   // that don't send SNI; SNICallback covers everyone else.
   const baseLeaf = mintLeafCert(ca, target.hostname)
+  // The inner server serves this one tunnel, so the server name its
+  // handshake saw is the tunnel's. Taken from SNICallback where the
+  // runtime calls it, else from the request's socket (see serverNameOf).
+  let serverName: string | undefined
   const inner = createHttpsServer({
     ALPNProtocols: ['http/1.1'],
     cert: baseLeaf.certPem,
     key: baseLeaf.keyPem,
     SNICallback: (servername, cb) => {
+      if (servername) serverName = servername
       try {
         cb(null, secureContextFor(ca, servername || target.hostname))
       } catch (err) {
@@ -241,7 +259,7 @@ export function terminateAndForward(
       getBodySubstitutions,
       req,
       res,
-      target,
+      { ...target, clientServerName: serverName },
       leg,
       planSigv4,
       maxSigv4BodyBytes,
@@ -403,12 +421,17 @@ function forwardUpstreamGuarded(
 ): void {
   // Fire-and-forget from the request handler: a rejection (e.g. a
   // synchronous throw writing a denial to a client that already reset)
-  // must not become an unhandledRejection.
+  // must not become an unhandledRejection, and the client still gets an
+  // answer (502, or a reset once headers are out) instead of waiting for
+  // a server timeout.
+  const [, , , req, res] = args
   forwardUpstream(...args).catch(err => {
     logForDebugging(
       `[tls-terminate] forwardUpstream failed: ${(err as Error).message}`,
       { level: 'error' },
     )
+    respondUpstreamError(res, err as Error)
+    destroyAfterDenial(req, res)
   })
 }
 
@@ -430,10 +453,42 @@ async function forwardUpstream(
   // yields a well-formed URL, and discard any client-supplied authority so
   // the CONNECT-verified target stays authoritative (same rationale as the
   // Host-header note below).
-  const path = originFormPath(req.url)
+  // With filterRequest, the request target is normalized before the hook
+  // sees it and that normalized target is what is forwarded: some runtimes'
+  // HTTP clients normalize it again on the way out, and the hook must judge
+  // exactly what is sent. A target of any other shape could make the judged
+  // URL name another host, so it is refused. Without filterRequest nothing
+  // judges the path, so the target is forwarded unchanged (and a masked AWS
+  // credential is re-signed over those same bytes).
+  const path = filterRequest
+    ? normalizeRequestTarget(req.url ?? '/', req.method)
+    : originFormPath(req.url)
+  if (path === undefined) {
+    respondDenied(res, 'malformed request-target', undefined, 400)
+    return
+  }
   // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
   const authority = formatAuthority(target.hostname, target.port, 443)
   let body: Readable = req
+  let decision: RequestDecision | undefined
+  const sni = target.clientServerName ?? serverNameOf(req)
+  if (target.requireHostMatch) {
+    const why = hostMismatch(
+      hostHeaderValues(req.rawHeaders),
+      sni,
+      { hostname: target.hostname, port: target.port, defaultPort: 443 },
+      absoluteFormAuthority(req.url),
+    )
+    if (why !== undefined) {
+      target.onFilterRequestDeny?.(
+        req.method ?? 'GET',
+        `https://${authority}${path}`,
+        why,
+      )
+      respondDenied(res, why, undefined, 421)
+      return
+    }
+  }
   if (filterRequest) {
     const ac = new AbortController()
     res.once('close', () => ac.abort())
@@ -459,9 +514,17 @@ async function forwardUpstream(
       `https://${authority}${path}`,
       ac.signal,
       target.onFilterRequestDeny,
+      {
+        sni,
+        target: { host: target.hostname, port: target.port },
+        requestTarget: path,
+        rawHeaders: [...req.rawHeaders],
+        scheme: 'https',
+      },
     )
     if (out === null) return
-    body = out
+    body = out.body
+    decision = out.decision
     // The client may have aborted during the filterRequest await — the tee
     // branch is already destroyed and res 'close' already fired, so the
     // teardown listeners attached below would never run. Don't dial an
@@ -484,6 +547,9 @@ async function forwardUpstream(
   // allowlist saw — rather than forwarding the client's spelling.
   const fwdHeaders = stripHopByHop(req.headers)
   fwdHeaders.host = authority
+  // The decision's edits go before the credential hooks below, so a value
+  // a decision sets can itself carry a masked credential's sentinel.
+  if (decision) applyHeaderEdits(fwdHeaders, decision)
   // SigV4 planning runs on the PRE-substitution headers (the trigger is
   // the fake access key id in the credential scope, which the header
   // substitution below replaces) but on the POST-strip view: the plan's
@@ -654,7 +720,12 @@ async function forwardUpstream(
         )
         res.destroy()
       })
-      if (relayResponseHead(res, upRes)) upRes.pipe(res)
+      const outHeaders = stripHopByHop(upRes.headers)
+      notifyResponse(decision, upRes.statusCode ?? 502, outHeaders)
+      if (target.stripResponseHeaders) {
+        removeHeadersFolded(outHeaders, target.stripResponseHeaders)
+      }
+      if (relayResponseHead(res, upRes, outHeaders)) upRes.pipe(res)
     },
   )
 
@@ -708,18 +779,6 @@ function collectBody(body: Readable, maxBytes: number): Promise<Buffer> {
   })
 }
 
-function originFormPath(reqUrl: string | undefined): string {
-  const raw = reqUrl ?? '/'
-  if (raw.startsWith('/')) return raw
-  try {
-    const u = new URL(raw)
-    return `${u.pathname}${u.search}` || '/'
-  } catch {
-    // asterisk-form (`OPTIONS *`) or anything else non-absolute — pass through.
-    return raw
-  }
-}
-
 let sockSeq = 0
 function innerSocketPath(): string {
   // Keep it short — macOS sun_path is 104 bytes.
@@ -727,4 +786,32 @@ function innerSocketPath(): string {
     tmpdir(),
     `srt-tt-${process.pid}-${(sockSeq++).toString(36)}.sock`,
   )
+}
+
+/** The authority of an absolute-form request-target, as spelled; undefined for origin form. */
+function absoluteFormAuthority(reqUrl: string | undefined): string | undefined {
+  const m = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(reqUrl ?? '')
+  return m ? m[1] : undefined
+}
+
+/** The TLS server name on the request's socket, where the runtime exposes it. */
+function serverNameOf(req: IncomingMessage): string | undefined {
+  const name = (req.socket as { servername?: unknown }).servername
+  return typeof name === 'string' && name !== '' ? name : undefined
+}
+
+/**
+ * The request-target as forwarded when no filterRequest is configured:
+ * origin form verbatim, an absolute URI reduced to its path and query, and
+ * anything else (`OPTIONS *`) passed through.
+ */
+function originFormPath(reqUrl: string | undefined): string {
+  const raw = reqUrl ?? '/'
+  if (raw.startsWith('/')) return raw
+  try {
+    const u = new URL(raw)
+    return `${u.pathname}${u.search}` || '/'
+  } catch {
+    return raw
+  }
 }
