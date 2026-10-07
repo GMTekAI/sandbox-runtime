@@ -1,4 +1,7 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { test, expect, beforeAll, afterAll } from 'bun:test'
+// Every case here runs a proxy configured to terminate TLS, so each is
+// skipped where this runtime cannot terminate it in-process.
+import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { connect, createServer, type AddressInfo, type Server } from 'node:net'
 import type { LookupFunction, Socket } from 'node:net'
 import {

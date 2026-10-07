@@ -11,6 +11,7 @@ import {
   type PathListKind,
 } from './path-entries.js'
 import { createHttpProxyServer } from './http-proxy.js'
+import { assertTlsTerminationSupported } from './emitted-connection.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
@@ -577,6 +578,8 @@ async function startMuxProxyServer(
     stripResponseHeaders: config?.network.stripResponseHeaders,
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
     requireHostMatch: config?.network.requireHostMatch,
+    maxTerminatedTunnels: config?.network.tlsTerminate?.maxTunnels,
+    tlsHandshakeTimeoutMs: config?.network.tlsTerminate?.handshakeTimeoutMs,
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
       recordProxyViolation(
         `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
@@ -699,6 +702,9 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
+  // Before any CA, proxy or sandbox is set up: a runtime that cannot
+  // terminate TLS in-process fails here, not on each tunnel.
+  if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
   // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
   // defer CA creation until the Windows block below has resolved
   // srt-win and fetched user status — the persistent CA is

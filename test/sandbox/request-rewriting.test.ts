@@ -1,5 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import {
+  SERVES_EMITTED_CONNECTIONS,
+  testWithTls,
+} from '../helpers/emitted-connections.js'
+import {
   createServer as createHttpServer,
   type IncomingHttpHeaders,
   type IncomingMessage,
@@ -251,6 +255,9 @@ async function probeServerNameSupport(): Promise<boolean> {
   return fromCallback === 'localhost' || fromSocket === 'localhost'
 }
 const EXPOSES_SERVER_NAME = await probeServerNameSupport()
+const testIfServerName = test.skipIf(
+  !EXPOSES_SERVER_NAME || !SERVES_EMITTED_CONNECTIONS,
+)
 
 describe('applyHeaderEdits', () => {
   test('removals fold case and the separators - _ and .', () => {
@@ -312,6 +319,8 @@ describe('applyHeaderEdits: framing and grouping', () => {
 })
 
 describe('an allow decision rewrites the forwarded request', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const rewrite: FilterRequestCallback = async () => ({
     action: 'allow',
     removeHeaders: ['x-api-key'],
@@ -371,6 +380,8 @@ describe('an allow decision rewrites the forwarded request', () => {
 })
 
 describe('a set strips every spelling of its name the client sent', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const setFoo: FilterRequestCallback = async () => ({
     action: 'allow',
     setHeaders: [['x-foo', 'real']],
@@ -409,6 +420,8 @@ describe('a set strips every spelling of its name the client sent', () => {
 })
 
 describe('edits and the credential hooks, in the same order on both paths', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   // A stand-in for the masked-credential substitution: swaps a sentinel
   // for the real value in any header, as the manager's hook does.
   const substitute = (h: IncomingHttpHeaders): void => {
@@ -477,6 +490,8 @@ describe('edits and the credential hooks, in the same order on both paths', () =
 })
 
 describe('a deny decision chooses its status', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   test('the status and reason reach the client, and nothing is dialled', async () => {
     const before = seen.length
     await withProxy(
@@ -508,6 +523,8 @@ describe('a deny decision chooses its status', () => {
 })
 
 describe('TRACE is refused before filterRequest is asked', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   // Its response echoes the request, so a header the decision sets would
   // come back to the client. (TRACK is refused too, but Node's and Bun's
   // HTTP parsers answer it 400 before the proxy sees it.)
@@ -562,6 +579,8 @@ describe('TRACE is refused before filterRequest is asked', () => {
 })
 
 describe('a malformed decision denies', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const malformed: Array<[string, unknown]> = [
     ['null', null],
     ['an unknown action', { action: 'maybe' }],
@@ -643,6 +662,8 @@ describe('a malformed decision denies', () => {
 })
 
 describe('the callback gets the request details it cannot recover from the Request', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   test('TLS-terminated: server name, CONNECT target, request-target and raw headers', async () => {
     let got: RequestInfo | undefined
     await withProxy(
@@ -719,6 +740,8 @@ describe('normalizeRequestTarget', () => {
 })
 
 describe('the request-target the callback sees is the one forwarded', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   // Each spelling would pass a naive "/public/" prefix rule, or dodge a
   // "/admin" deny rule, if the callback saw it raw while the proxy (or the
   // runtime's HTTP client) forwarded a normalized form.
@@ -769,6 +792,8 @@ describe('the request-target the callback sees is the one forwarded', () => {
 })
 
 describe('a request-target of any other shape is refused with 400', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   test('TLS-terminated: @host, a bare name, a non-http scheme and * without OPTIONS', async () => {
     let asked = 0
     const before = seen.length
@@ -828,6 +853,8 @@ describe('a request-target of any other shape is refused with 400', () => {
 })
 
 describe('an allow decision can observe the upstream response', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   test('onResponse sees the status and headers before the client does, on both paths', async () => {
     const got: Array<{ status: number; headers: IncomingHttpHeaders }> = []
     await withProxy(
@@ -937,6 +964,8 @@ describe('an allow decision can observe the upstream response', () => {
 })
 
 describe('stripResponseHeaders', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   test('keeps the listed response headers from the client on both paths', async () => {
     let observed: IncomingHttpHeaders | undefined
     await withProxy(
@@ -980,6 +1009,8 @@ function plainInsideConnect(proxyPort: number): Promise<string> {
 }
 
 describe('refuseOpaqueTunnels', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const allowAll: FilterRequestCallback = async () => ({ action: 'allow' })
 
   test('by default a non-TLS CONNECT is tunnelled past filterRequest', async () => {
@@ -1040,6 +1071,8 @@ describe('refuseOpaqueTunnels', () => {
 })
 
 describe('refuseOpaqueTunnels on the shared HTTP and SOCKS port', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const allowAll: FilterRequestCallback = async () => ({ action: 'allow' })
 
   /** The manager's front end: one port, sniffed into HTTP or SOCKS. */
@@ -1259,6 +1292,8 @@ describe('hostMismatch: the Host and server-name shapes that name the target', (
 })
 
 describe('requireHostMatch', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   let asked = 0
   const counting: FilterRequestCallback = async () => {
     asked++
@@ -1282,7 +1317,7 @@ describe('requireHostMatch', () => {
     expect(seen.length).toBe(before + 1)
   }, 15_000)
 
-  test.skipIf(!EXPOSES_SERVER_NAME)(
+  testIfServerName(
     'TLS-terminated: a server name of another host is answered 421',
     async () => {
       asked = 0

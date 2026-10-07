@@ -935,6 +935,36 @@ export const NetworkConfigSchema = z.object({
             'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
             'log), so paths that exist on only some hosts are safe to list.',
         ),
+      maxTunnels: z
+        .number()
+        .int()
+        .min(1)
+        .max(65536)
+        .optional()
+        .describe(
+          'At most this many CONNECT tunnels are TLS-terminated at once ' +
+            '(default 256); past it a CONNECT is answered 503 with ' +
+            '"X-Proxy-Error: too-many-tunnels". A tunnel holds its slot from ' +
+            'its CONNECT until it closes, so idle keep-alive tunnels count; ' +
+            'one that turns out not to carry TLS frees it. The slot is taken ' +
+            'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
+            '(SSH, say) to a host that would be terminated is refused too. ' +
+            'Hosts in excludeDomains do not count. Read when the proxy ' +
+            'starts; updateConfig does not change it.',
+        ),
+      handshakeTimeoutMs: z
+        .number()
+        .int()
+        .min(100)
+        .max(600_000)
+        .optional()
+        .describe(
+          'A tunnel to be TLS-terminated must finish its TLS handshake ' +
+            'within this many milliseconds of its CONNECT (default 10000), ' +
+            'or it is closed and its slot freed. A tunnel past its handshake ' +
+            'is never timed out by it. Read when the proxy starts; ' +
+            'updateConfig does not change it.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -943,7 +973,9 @@ export const NetworkConfigSchema = z.object({
     .describe(
       '[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
         'request/response bodies are visible to SRT. Provide a CA cert+key, ' +
-        'or omit both to have SRT generate an ephemeral one.',
+        'or omit both to have SRT generate an ephemeral one. Needs Node, or ' +
+        'Bun 1.4 or later: SandboxManager.initialize throws on an older ' +
+        'runtime.',
     ),
   parentProxy: ParentProxyConfigSchema.optional().describe(
     "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +

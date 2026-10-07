@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { testWithTls } from '../helpers/emitted-connections.js'
 import { createServer as createHttpsServer } from 'node:https'
 import {
   createServer as createHttpServer,
@@ -63,6 +64,8 @@ function expectReframed(got: SeenRequest, clientSentLength: number): void {
 }
 
 describe('credential-mask-body: end-to-end through the TLS-terminating proxy', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
 
   let upstream: Server

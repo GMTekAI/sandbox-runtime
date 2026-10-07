@@ -8,6 +8,7 @@
  * enforces the decision; the library does not bless any matching DSL.
  */
 
+import { endRequestAfterResponse } from './emitted-connection.js'
 import type {
   IncomingHttpHeaders,
   IncomingMessage,
@@ -146,12 +147,18 @@ export const DEFAULT_DENY_REASON = 'denied by sandbox policy'
  * away (observed on Node; the unread request body makes close send RST).
  */
 function destroyAfterResponse(req: IncomingMessage, res: ServerResponse): void {
-  if (res.writableFinished || res.destroyed) {
+  if (res.destroyed) {
     req.destroy()
     return
   }
-  res.once('finish', () => req.destroy())
-  res.once('close', () => req.destroy())
+  if (res.writableFinished) {
+    endRequestAfterResponse(req)
+    return
+  }
+  res.once('finish', () => endRequestAfterResponse(req))
+  res.once('close', () => {
+    if (!res.writableFinished) req.destroy()
+  })
 }
 
 /**
@@ -180,6 +187,7 @@ export async function decideAndRespond(
   const method = req.method ?? 'GET'
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
+  let shim: PassThrough | undefined
   // Gate on a declared body, not just the method: a GET/HEAD/OPTIONS with
   // Content-Length or Transfer-Encoding is legal HTTP and its body must go
   // through the tee like any other — skipping it here would hide the body
@@ -203,10 +211,11 @@ export async function decideAndRespond(
     // terminator; on the SigV4 path a truncated buffer would be signed).
     // The shim's own error listener covers the tee cancelling it while
     // the client is still piping.
-    const shim = new PassThrough()
-    shim.on('error', () => {})
-    req.pipe(shim)
-    const web = Readable.toWeb(shim) as ReadableStream<Uint8Array>
+    const teeSource = new PassThrough()
+    shim = teeSource
+    teeSource.on('error', () => {})
+    req.pipe(teeSource)
+    const web = Readable.toWeb(teeSource) as ReadableStream<Uint8Array>
     const [a, b] = web.tee()
     forCallback = a
     forUpstream = Readable.fromWeb(b)
@@ -216,7 +225,7 @@ export async function decideAndRespond(
     // land on a listener-less stream.
     upstreamBranch.on('error', () => {})
     req.on('error', err => {
-      shim.end()
+      teeSource.end()
       upstreamBranch.destroy(err)
     })
   }
@@ -232,8 +241,7 @@ export async function decideAndRespond(
     onDeny?.(method, url, reason)
     deny(res, { action: 'deny', status: 405, reason })
     forCallback?.cancel().catch(() => {})
-    forUpstream.destroy()
-    if (forUpstream !== req) destroyAfterResponse(req, res)
+    endDeniedBody(req, res, forUpstream, shim)
     return null
   }
 
@@ -258,11 +266,7 @@ export async function decideAndRespond(
     onDeny?.(method, url, reason)
     deny(res, { action: 'deny', reason })
     forCallback?.cancel().catch(() => {})
-    forUpstream.destroy()
-    // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
-    // to destroy req; without this a denied client keeps uploading into a
-    // stalled pipe and holds the connection open.
-    if (forUpstream !== req) destroyAfterResponse(req, res)
+    endDeniedBody(req, res, forUpstream, shim)
     return null
   }
 
@@ -309,9 +313,36 @@ export async function decideAndRespond(
 
   onDeny?.(method, url, decision.reason ?? DEFAULT_DENY_REASON)
   deny(res, decision)
-  forUpstream.destroy()
-  if (forUpstream !== req) destroyAfterResponse(req, res)
+  endDeniedBody(req, res, forUpstream, shim)
   return null
+}
+
+/**
+ * After a deny, stop the request: destroy a teed body's upstream branch at
+ * once, and the request itself once the answer is out. The shim breaks the
+ * old fromWeb→tee→toWeb cancel cascade that used to destroy req; without
+ * this a denied client keeps uploading into a stalled pipe and holds the
+ * connection open. Destroying req before the answer is flushed loses the
+ * answer under Node (for a request without a body, req is what destroys
+ * the socket).
+ *
+ * A teed body's bytes stop going to the shim at once and are dropped from
+ * then on: the tee is cancelled, and a byte the shim passed on to its
+ * closed web stream would throw (Bun: "Controller is already closed").
+ */
+function endDeniedBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  forUpstream: Readable,
+  shim: PassThrough | undefined,
+): void {
+  if (shim !== undefined) {
+    req.unpipe(shim)
+    shim.pause()
+    req.resume()
+  }
+  if (forUpstream !== req) forUpstream.destroy()
+  destroyAfterResponse(req, res)
 }
 
 const PLAINTEXT_HEADER_SET_REASON =

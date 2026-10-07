@@ -8,6 +8,11 @@ import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import { encodedCommandFromProxyUser } from './sandbox-utils.js'
+import {
+  assertTlsTerminationSupported,
+  type ByteBudget,
+  createByteBudget,
+} from './emitted-connection.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -91,7 +96,9 @@ export interface HttpProxyServerOptions {
    * If present, CONNECT requests are TLS-terminated in-process and the
    * decrypted HTTP forwarded upstream over real TLS, instead of opening an
    * opaque byte tunnel. Mutually exclusive with getMitmSocketPath at the
-   * config layer (sandbox-manager rejects both being set).
+   * config layer (sandbox-manager rejects both being set). Needs Node, or
+   * Bun 1.4 or later: on an older runtime createHttpProxyServer throws
+   * (see assertTlsTerminationSupported).
    */
   mitmCA?: MitmCA
 
@@ -261,10 +268,57 @@ export interface HttpProxyServerOptions {
    * onFilterRequestDenied. See hostMismatch for the accepted shapes.
    */
   requireHostMatch?: boolean
+
+  /**
+   * At most this many CONNECT tunnels are TLS-terminated at once (default
+   * 256); a CONNECT past it is answered 503 with `X-Proxy-Error:
+   * too-many-tunnels`. Each holds a TLS session and an HTTP parser in this
+   * process. A slot is taken when a CONNECT to a host that would be
+   * terminated is accepted, before its first bytes are seen, and held until
+   * the tunnel closes (an idle keep-alive tunnel holds one too), or until
+   * the tunnel turns out not to carry TLS. So at the cap, a CONNECT that
+   * would have been tunnelled opaquely as non-TLS is refused too.
+   * SandboxManager sets it from network.tlsTerminate.maxTunnels.
+   */
+  maxTerminatedTunnels?: number
+
+  /**
+   * A tunnel to be TLS-terminated must finish its TLS handshake this long
+   * after its CONNECT (default 10 s), or it is closed and its slot freed.
+   * A tunnel that finished its handshake is not timed out afterwards.
+   * SandboxManager sets it from network.tlsTerminate.handshakeTimeoutMs.
+   */
+  tlsHandshakeTimeoutMs?: number
+
+  /**
+   * Bytes all of this proxy's connections together may hold for slow
+   * parties: request bodies waiting for an upstream, and responses waiting
+   * for a client. Past it, each holds no more than it must (default
+   * 256 MiB).
+   *
+   * Where it applies to request bodies: inside TLS-terminated tunnels under
+   * Bun, on connections the proxy is handed with emit('connection'). Under
+   * Node the runtime's own server applies backpressure to an upload, so
+   * nothing needs counting. A tunnel on a connection Bun's own listener
+   * accepted (the proxy's listen(), which is how SandboxManager runs it) is
+   * read on by the runtime while paused, so an upload to a stalled upstream
+   * is buffered without bound there whatever this says; that is a
+   * limitation of the runtime.
+   */
+  maxBufferedBytes?: number
+  /** @internal A budget to use in place of a new one, so a test can read its counter. */
+  byteBudget?: ByteBudget
 }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
+  // Before anything is set up: a runtime that cannot terminate TLS
+  // in-process fails here, not on each tunnel.
+  if (options.mitmCA) assertTlsTerminationSupported()
   const server = createServer()
+  let terminatedTunnels = 0
+  const byteBudget =
+    options.byteBudget ??
+    createByteBudget(options.maxBufferedBytes ?? 256 << 20)
 
   // A client that is killed mid-exchange (sandboxed process tree teardown)
   // resets its connection; without a listener that surfaces as an
@@ -547,9 +601,43 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // only terminate if it is one. Non-TLS falls through to the opaque
         // tunnel below — i.e. base-sandbox behaviour, hostname-allowlisted
         // but not content-inspected (same as the SOCKS path).
+        if (terminatedTunnels >= (options.maxTerminatedTunnels ?? 256)) {
+          socket.end(
+            `HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nX-Proxy-Error: too-many-tunnels\r\nConnection: close\r\n\r\ntoo many TLS-terminated tunnels at once`,
+          )
+          return
+        }
+        // A slot is held from here to the tunnel's close, or until it turns
+        // out not to be TLS; its handshake must be done by the deadline.
+        terminatedTunnels++
+        let slotHeld = true
+        const freeSlot = (): void => {
+          if (!slotHeld) return
+          slotHeld = false
+          terminatedTunnels--
+        }
+        let handshakeDone = (): boolean => false
+        const deadline = setTimeout(() => {
+          // The deadline is for the handshake only: a client that finished
+          // it and has sent nothing since keeps its tunnel.
+          if (handshakeDone()) return
+          logForDebugging(
+            `[proxy] TLS handshake not done in time for ${hostname}:${port}; tunnel closed`,
+          )
+          socket.destroy()
+        }, options.tlsHandshakeTimeoutMs ?? 10_000)
+        deadline.unref?.()
+        socket.once('close', () => {
+          clearTimeout(deadline)
+          freeSlot()
+        })
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         wrote200 = true
         const peeked = await peekForClientHello(socket, head)
+        if (!peeked.isTLS) {
+          clearTimeout(deadline)
+          freeSlot()
+        }
         if (clientGone || socket.destroyed) {
           socket.destroy()
           return
@@ -570,6 +658,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               lookup,
               stripResponseHeaders: options.stripResponseHeaders,
               requireHostMatch: options.requireHostMatch,
+              byteBudget,
+              onEstablished: () => clearTimeout(deadline),
+              onHandshakeProbe: isDone => {
+                handshakeDone = isDone
+              },
               onFilterRequestDeny: options.onFilterRequestDenied
                 ? (method, url, reason) =>
                     options.onFilterRequestDenied!({
