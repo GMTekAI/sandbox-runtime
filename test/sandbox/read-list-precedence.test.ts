@@ -24,6 +24,7 @@ import {
   lastIndexOfMount,
   lastMountAt,
 } from '../helpers/bwrap-argv.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
@@ -52,6 +53,7 @@ const TOKEN_LINK = join(VAULT, 'link-to-token')
 const DIR_LINK = join(VAULT, 'link-to-dir')
 const BRACKETS_LINK = join(VAULT, 'link-to-brackets')
 const VAULT_LINK = join(ROOT, 'link-to-vault')
+const LINKED_DIR = join(VAULT_LINK, 'dir')
 const ROOT_LINK = join(ROOT, 'link-to-root')
 const JAR = join(ROOT, 'agent', 'agent.jar')
 
@@ -161,6 +163,7 @@ describe.if(!isWindows)('precedence between the read lists', () => {
         BRACKETS_TOKEN,
         'RUMU',
       ],
+      [TOKEN, { allowRead: [TOKEN_LINK] }, TOKEN, 'UUMU'],
       [TOKEN_LINK, {}, TOKEN, 'UUMU'],
       [TOKEN_LINK, { denyRead: [VAULT], allowRead: [TOKEN] }, TOKEN, 'RUMU'],
       [join(VAULT_LINK, 'v1', 'token'), {}, TOKEN, 'UUMU'],
@@ -169,7 +172,9 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       [DIR, { allowRead: [DIR] }, DEEP_TOKEN, 'RU--'],
       [DIR, { allowRead: [DEEP] }, DEEP_TOKEN, 'RU--'],
       [DIR, { allowRead: [DEEP_TOKEN] }, DEEP_TOKEN, 'RU--'],
-      [DIR, { allowRead: [join(DIR_LINK, 'deep')] }, DEEP_TOKEN, '-U--'],
+      [DIR, { allowRead: [join(DIR_LINK, 'deep')] }, DEEP_TOKEN, 'RU--'],
+      [DIR, { allowRead: [join(DIR_LINK, 'deep', '*')] }, DEEP_TOKEN, 'RU--'],
+      [DIR, { allowRead: [DIR_LINK] }, DEEP_TOKEN, 'UU--'],
       [DIR, { allowWrite: [DIR] }, DEEP_TOKEN, `${W}U--`],
       [DIR, { allowWrite: [DEEP] }, DEEP_TOKEN, `${W}U--`],
       [DIR, { allowWrite: [VAULT] }, DEEP_TOKEN, 'UU--'],
@@ -185,6 +190,18 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       [DIR, { denyRead: [VAULT], allowWrite: [DEEP] }, DEEP_TOKEN, `${W}U--`],
       [DIR_LINK, {}, DEEP_TOKEN, 'UU--'],
       [DIR_LINK, { allowRead: [DEEP] }, DEEP_TOKEN, 'RU--'],
+      [
+        LINKED_DIR,
+        { allowRead: [join(LINKED_DIR, 'deep')] },
+        DEEP_TOKEN,
+        'RU--',
+      ],
+      [
+        join(LINKED_DIR, 'deep'),
+        { denyRead: [VAULT_LINK], allowRead: [LINKED_DIR] },
+        DEEP_TOKEN,
+        'UU--',
+      ],
       [join(VAULT, '**', '.netrc'), {}, NETRC, 'UU--'],
       [join(VAULT, '**', '.netrc'), { allowRead: [NETRC] }, NETRC, 'RU--'],
       [join(VAULT, '**', '.netrc'), { allowRead: [SUB] }, NETRC, 'UU--'],
@@ -328,6 +345,14 @@ describe.if(!isWindows)('precedence between the read lists', () => {
         ).toBe('-----BEGIN')
       })
     }
+
+    it.if(isLinux)('the debug log names none of them', async () => {
+      const { trustBundlePath } = SandboxManager.getMitmCA()!
+      const { warnings } = await withCapturedWarnings(() =>
+        reading('true', 'credential deny', dirname(trustBundlePath)),
+      )
+      expect(warnings.filter(w => w.includes('not bound back'))).toEqual([])
+    })
   })
 
   describe.if(isLinux || isMacOS)('the configs the manager reports', () => {
@@ -451,6 +476,32 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       })
     }
 
+    it.each<[Lists]>([
+      [{ allowRead: [DEEP] }],
+      [{ allowWrite: [DEEP] }],
+      [{ allowRead: [DEEP, V1], allowWrite: [DEEP, V1] }],
+    ])(
+      'the debug log names once a path at or beneath a credential deny: %j',
+      async lists => {
+        for (const [kind, lines] of [
+          ['denyRead', []],
+          [
+            'credential deny',
+            [
+              `[SandboxDebug] [Sandbox Linux] ${DEEP} is at or beneath the credential deny ${DIR}: not bound back`,
+            ],
+          ],
+        ] as const) {
+          const { warnings } = await withCapturedWarnings(() =>
+            wrap(kind, DIR_LINK, lists),
+          )
+          expect(warnings.filter(w => w.includes('not bound back'))).toEqual([
+            ...lines,
+          ])
+        }
+      },
+    )
+
     it('an entry on the root takes its exceptions by its kind', async () => {
       const top = await wrap('denyRead', '/', { allowRead: ['/usr'] })
       expect(countMounts(top, '--tmpfs', '/usr')).toBe(0)
@@ -497,22 +548,26 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       )
     }
 
-    /** Whether a filter of the first file-read* deny rule matches `file`. */
-    const denies = (profile: string, file: string): boolean => {
-      const denyAt = profile.indexOf('(deny file-read*\n')
-      return profile
-        .slice(denyAt, profile.indexOf('(with message', denyAt))
-        .split('\n')
-        .some(line => {
-          const [, kind, text] =
-            /^ {2}\((subpath|regex) (".*")\)$/.exec(line) ?? []
-          if (text === undefined) return false
-          const value = JSON.parse(text) as string
-          return kind === 'regex'
-            ? new RegExp(value).test(file)
-            : isAtOrUnder(file, value)
-        })
-    }
+    /** Whether a filter of the first file-read* rule of `action` matches. */
+    const firstRule =
+      (action: 'allow' | 'deny') =>
+      (profile: string, file: string): boolean => {
+        const at = profile.indexOf(`(${action} file-read*\n`)
+        return profile
+          .slice(at, profile.indexOf('(with message', at))
+          .split('\n')
+          .some(line => {
+            const [, kind, text] =
+              /^ {2}\((subpath|regex) (".*")\)$/.exec(line) ?? []
+            if (text === undefined) return false
+            const value = JSON.parse(text) as string
+            return kind === 'regex'
+              ? new RegExp(value).test(file)
+              : isAtOrUnder(file, value)
+          })
+      }
+    const denies = firstRule('deny')
+    const allows = firstRule('allow')
 
     /** The trailing file-write-unlink deny rule, or '' when there is none. */
     const unlinkDenies = (
@@ -601,7 +656,7 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       expect(late).not.toContain('(require-not (subpath "/tmp-x/other"))')
     })
 
-    it('a deny is emitted where its path leads as well as where it is spelled', () => {
+    it('a deny is emitted under both spellings of its path', () => {
       for (const as of [(c: FsReadRestrictionConfig) => c, asCredential]) {
         const profile = profileOf(
           as({
@@ -627,9 +682,63 @@ describe.if(!isWindows)('precedence between the read lists', () => {
       }
     })
 
-    it('a masked file is denied where its path leads', () => {
+    it('a masked file is denied under both spellings of its path', () => {
       const profile = profileOf({ denyOnly: [] }, { masked: TOKEN_LINK })
+      expect(denies(profile, TOKEN_LINK)).toBe(true)
       expect(denies(profile, TOKEN)).toBe(true)
+    })
+
+    it.each<[string, string, boolean]>([
+      [join(LINKED_DIR, 'deep'), join(LINKED_DIR, 'deep', 'token'), true],
+      [join(LINKED_DIR, 'deep'), DEEP_TOKEN, true],
+      [join(LINKED_DIR, 'deep', '*'), DEEP_TOKEN, true],
+      [join(DIR_LINK, '*'), DEEP, true],
+      [join(BRACKETS_LINK, '*'), BRACKETS_TOKEN, true],
+      [DIR_LINK, DEEP_TOKEN, false],
+      [TOKEN_LINK, TOKEN, false],
+      [join(ROOT_LINK, '*'), ROOT, false],
+    ])(
+      'an allow is emitted under both spellings of its name: %s, %s: %p',
+      (allow, file, matches) => {
+        const profile = profileOf({
+          denyOnly: [VAULT],
+          allowWithinDeny: [allow],
+        })
+        expect(allows(profile, file)).toBe(matches)
+      },
+    )
+
+    it('both spellings of an allow count against the denies around it', () => {
+      const nested = { denyOnly: [DEEP], allowWithinDeny: [LINKED_DIR] }
+      expect(lateDenies(profileOf(nested))).toContain(`  (subpath "${DEEP}")\n`)
+
+      const minus = (allow: string): string =>
+        `(require-not (subpath "${allow}"))`
+      const covered = {
+        denyOnly: [join(VAULT, '**', 'token')],
+        allowWithinDeny: [join(LINKED_DIR, 'deep', 'token')],
+      }
+      expect(lateDenies(profileOf(covered))).toContain(minus(DEEP_TOKEN))
+      expect(unlinkDenies(covered, [VAULT])).toContain(minus(DEEP_TOKEN))
+      expect(
+        unlinkDenies(
+          { denyOnly: [DIR], allowWithinDeny: [join(LINKED_DIR, 'deep')] },
+          [VAULT],
+        ),
+      ).toContain(minus(DEEP))
+
+      const own = join(VAULT_LINK, 'v1', 'sibling')
+      expect(
+        lateDenies(
+          profileOf(
+            asCredential({
+              denyOnly: [VAULT],
+              allowWithinDeny: [own],
+              ownAllowWithinDeny: [own],
+            }),
+          ),
+        ),
+      ).toContain(`  (require-all (subpath "${VAULT}") ${minus(SIBLING)})\n`)
     })
 
     it.each([

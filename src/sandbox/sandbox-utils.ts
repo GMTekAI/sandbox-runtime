@@ -93,6 +93,20 @@ export function pathSpellings(candidatePath: string): string[] {
   return [candidatePath]
 }
 
+/**
+ * Where the name `p` lives: its parent directories as `canonicalOf` resolves
+ * them, its last component as written. An allowRead entry is read so: one
+ * that is a symlink names the link, and nothing the link points at.
+ */
+export function nameLocation(
+  p: string,
+  canonicalOf: (dir: string) => string,
+): string {
+  if (p === '/') return p
+  const parent = canonicalOf(path.dirname(p))
+  return `${parent === '/' ? '' : parent}/${path.basename(p)}`
+}
+
 /** `process.cwd()`, or undefined where that throws: it has been removed. */
 export function workingDirectory(): string | undefined {
   try {

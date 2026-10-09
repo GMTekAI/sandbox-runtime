@@ -22,6 +22,7 @@ import {
   isAbsenceErrno,
   isAtOrUnder,
   isStrictlyUnder,
+  nameLocation,
   getDangerousDirectories,
   workingDirectory,
 } from './sandbox-utils.js'
@@ -1978,11 +1979,7 @@ async function generateFilesystemArgs(
   // component as written. This, not what `p` resolves to, decides which read
   // deny an allowRead entry is an exception to: an entry that is a symlink
   // names the link, and re-allows nothing the link points at.
-  const nameLocationOf = (p: string): string => {
-    if (p === '/') return p
-    const parent = canonicalForm(path.dirname(p))
-    return `${parent === '/' ? '' : parent}/${path.basename(p)}`
-  }
+  const nameLocationOf = (p: string): string => nameLocation(p, canonicalForm)
   // Whether a canonical path lies inside the write allowlist, and so
   // whether it is denied, stubbed and pinned at all: a path outside it is
   // left read-only by the initial --ro-bind / /. The deny pre-pass, the deny
@@ -2936,10 +2933,22 @@ async function generateFilesystemArgs(
     ({ mount, isCredential }) =>
       mount !== undefined && isCredential ? [mount.landing] : [],
   )
-  const outsideCredentials = (p: string): boolean =>
-    !credentialLandings.some(at => isAtOrUnder(nameLocationOf(p), at))
+  const leftOut = new Set<string>()
+  const outsideCredentials = (p: string): boolean => {
+    const landing = credentialLandings.find(at =>
+      isAtOrUnder(nameLocationOf(p), at),
+    )
+    if (landing !== undefined && !leftOut.has(p)) {
+      leftOut.add(p)
+      logForDebugging(
+        `[Sandbox Linux] ${p} is at or beneath the credential deny ${landing}: not bound back`,
+        { level: 'warn' },
+      )
+    }
+    return landing === undefined
+  }
   const restorableReadPaths = readAllowPaths().filter(
-    p => outsideCredentials(p) || ownReadAllowPaths().includes(p),
+    p => ownReadAllowPaths().includes(p) || outsideCredentials(p),
   )
   const restorableWritePaths = allowedWritePaths.filter(outsideCredentials)
 

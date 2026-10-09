@@ -16,6 +16,7 @@ import {
   denyGlobRegex,
   isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
+  nameLocation,
   pathSpellings,
   DANGEROUS_FILES,
   getDangerousDirectories,
@@ -354,15 +355,19 @@ interface ResolvedReadConfig {
 }
 
 /**
- * A deny entry, and the same entry where its path really is when a link on
- * the way leads elsewhere: Seatbelt compares the kernel's canonical path. Of
- * a pattern, the directory it starts from is what is resolved. The root is
- * never a second location.
+ * A read entry under both spellings of its path: as written, and with the
+ * links on the way resolved. A deny is resolved to its end. An allow is a
+ * name, so its last component stays as written. Of a pattern, the directory
+ * it starts from is what is resolved. The root is never a second spelling.
  */
-function withCanonicalLocation(entry: PathEntry): PathEntry[] {
+function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
+  const resolved = (p: string): string => pathSpellings(p)[1] ?? p
   const base = entryBaseDir(entry)
-  const canonical = pathSpellings(base)[1]
-  if (canonical === undefined || canonical === '/') return [entry]
+  const canonical =
+    kind === 'deny' || entry.glob
+      ? resolved(base)
+      : nameLocation(base, resolved)
+  if (canonical === base || canonical === '/') return [entry]
   return [
     entry,
     entry.glob
@@ -388,18 +393,20 @@ function resolveReadConfig(
   const credentialDenies = [
     ...callerEntries('deny', config.credentialDenyOnly, undefined),
     ...libraryDenies,
-  ].flatMap(withCanonicalLocation)
+  ].flatMap(entry => inBothSpellings('deny', entry))
   return {
     denies: [
       ...callerEntries(
         'deny',
         config.denyOnly.filter(p => !config.credentialDenyOnly?.includes(p)),
         config.literalDenyOnly,
-      ).flatMap(withCanonicalLocation),
+      ).flatMap(entry => inBothSpellings('deny', entry)),
       ...credentialDenies,
     ],
     credentialDenies: new Set(credentialDenies),
-    ownAllows: (config.ownAllowWithinDeny ?? []).map(toLiteralPathEntry),
+    ownAllows: (config.ownAllowWithinDeny ?? [])
+      .map(toLiteralPathEntry)
+      .flatMap(entry => inBothSpellings('allow', entry)),
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
@@ -407,7 +414,7 @@ function resolveReadConfig(
       'allow',
       config.allowWithinDeny,
       config.literalAllowWithinDeny,
-    ),
+    ).flatMap(entry => inBothSpellings('allow', entry)),
     writeRoots: [...writeRoots],
   }
 }
