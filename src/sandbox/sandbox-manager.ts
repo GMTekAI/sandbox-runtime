@@ -1403,7 +1403,8 @@ function getCredentialDenyReadPaths(
  * getter callers reach from permission checks and render paths. A mask entry
  * that degrades to a deny is a file and cannot cover a directory, so
  * leaving those out changes nothing. An entry with glob characters that is
- * also the name of a path counts as that name too.
+ * also the name of a path counts as that name too. The credential denies are
+ * judged apart, with no `allowRead`: they have no exceptions.
  */
 function defaultWritePathsUnder({
   denyRead,
@@ -1414,23 +1415,37 @@ function defaultWritePathsUnder({
   allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
-  return getDefaultWritePaths(
-    readRulesOf(denyRead, allowRead, getCredentialDenyReadPaths(credentials)),
+  const underCredentialDenies = getDefaultWritePaths(
+    readRulesOf([], undefined, getCredentialDenyReadPaths(credentials)),
+  )
+  return getDefaultWritePaths(readRulesOf(denyRead, allowRead, [])).filter(p =>
+    underCredentialDenies.includes(p),
   )
 }
 
 /**
- * Union the explicit `filesystem.denyRead` with credential-derived
- * deny paths. The single source of "what files does this config
- * want read-denied" — all platforms route through here so a new
- * credential kind that contributes deny paths reaches every
- * backend.
+ * The explicit `filesystem.denyRead` and the credential-derived deny paths,
+ * each through {@link resolveReadPathEntries}. The single source of "what
+ * files does this config want read-denied" on macOS and Linux, so a new
+ * credential kind that contributes deny paths reaches both. The credential
+ * ones are also returned apart, for the precedence the backends give them.
  */
-function unionDenyReadPaths(
-  denyRead: readonly string[],
+function* resolveReadDenies(
+  denyRead: readonly FilesystemPathEntry[] = [],
   credentialRestrictions: CredentialRestrictionConfig,
-): string[] {
-  return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
+): Steps<Pick<FsReadRestrictionConfig, 'denyOnly' | 'credentialDenyOnly'>> {
+  const listed = yield* resolveReadPathEntries('deny', denyRead, expandGlob)
+  const credentialDenyOnly = yield* resolveReadPathEntries(
+    'deny',
+    credentialRestrictions.denyReadPaths,
+    expandGlob,
+    credentialRestrictions.degradeToDenyPaths,
+  )
+  return {
+    denyOnly: [...new Set([...listed, ...credentialDenyOnly])],
+    ...(credentialDenyOnly.length > 0 && { credentialDenyOnly }),
+  }
 }
 
 /**
@@ -1553,12 +1568,9 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const unlistableDenyDirs = new Set<string>()
   const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
-    resolveReadPathEntries(
-      'deny',
-      unionDenyReadPaths(
-        spelledOf(config.filesystem.denyRead),
-        credentialRestrictions,
-      ),
+    resolveReadDenies(
+      config.filesystem.denyRead,
+      credentialRestrictions,
       (pattern, anchor) =>
         expandReadDenyGlobLinuxSteps(
           pattern,
@@ -1566,12 +1578,11 @@ function getFsReadConfig(): FsReadRestrictionConfig {
           unlistableDenyDirs,
           { anchor, listings },
         ),
-      credentialRestrictions.degradeToDenyPaths,
     ),
   )
 
   return {
-    denyOnly: denyPaths,
+    ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
     ...literalReadLists(
@@ -2017,14 +2028,16 @@ async function wrapWithSandboxAgain(
     if (expandedAllowRead === REPLACED) return startOver()
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
-    // paths fall under a user-configured denyRead.
+    // paths fall under a user-configured denyRead or credential entry.
+    const ownAllowWithinDeny: string[] = []
     if (mitmCA) {
-      expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
+      ownAllowWithinDeny.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
     // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
     if (javaAgentJarPath) {
-      expandedAllowRead.push(javaAgentJarPath)
+      ownAllowWithinDeny.push(javaAgentJarPath)
     }
+    expandedAllowRead.push(...ownAllowWithinDeny)
     const reExposedPaths = reExposedBy(
       expandedAllowRead,
       customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
@@ -2033,14 +2046,9 @@ async function wrapWithSandboxAgain(
     const unlistableDenyDirs = new Set<string>()
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await walked(
-      resolveReadPathEntries(
-        'deny',
-        unionDenyReadPaths(
-          spelledOf(
-            customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
-          ),
-          credentialRestrictions,
-        ),
+      resolveReadDenies(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        credentialRestrictions,
         (pattern, anchor) =>
           expandReadDenyGlobLinuxSteps(
             pattern,
@@ -2048,13 +2056,13 @@ async function wrapWithSandboxAgain(
             unlistableDenyDirs,
             { anchor, listings },
           ),
-        credentialRestrictions.degradeToDenyPaths,
       ),
     )
     if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
-      denyOnly: expandedDenyRead,
+      ...expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
       unlistableDenyDirs: [...unlistableDenyDirs],
       ...literalReadLists(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,

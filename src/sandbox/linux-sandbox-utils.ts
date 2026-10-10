@@ -22,6 +22,7 @@ import {
   isAbsenceErrno,
   isAtOrUnder,
   isStrictlyUnder,
+  nameLocation,
   getDangerousDirectories,
   workingDirectory,
 } from './sandbox-utils.js'
@@ -1985,11 +1986,7 @@ async function generateFilesystemArgs(
   // component as written. This, not what `p` resolves to, decides which read
   // deny an allowRead entry is an exception to: an entry that is a symlink
   // names the link, and re-allows nothing the link points at.
-  const nameLocationOf = (p: string): string => {
-    if (p === '/') return p
-    const parent = canonicalForm(path.dirname(p))
-    return `${parent === '/' ? '' : parent}/${path.basename(p)}`
-  }
+  const nameLocationOf = (p: string): string => nameLocation(p, canonicalForm)
   // Whether a canonical path lies inside the write allowlist, and so
   // whether it is denied, stubbed and pinned at all: a path outside it is
   // left read-only by the initial --ro-bind / /. The deny pre-pass, the deny
@@ -2020,6 +2017,16 @@ async function generateFilesystemArgs(
     (readAllowPathsMemo ??= (readConfig?.allowWithinDeny || []).map(p =>
       normalizePathForSandbox(p, { literal: true }),
     ))
+  let ownReadAllowPathsMemo: string[] | undefined
+  const ownReadAllowPaths = (): string[] =>
+    (ownReadAllowPathsMemo ??= (readConfig?.ownAllowWithinDeny ?? []).map(p =>
+      normalizePathForSandbox(p, { literal: true }),
+    ))
+  // The denyOnly entries that are credential denies, as they are spelled
+  // there, and what may be an exception to a read deny of either kind.
+  const credentialDenies = new Set(readConfig?.credentialDenyOnly)
+  const readExceptionsTo = (isCredential: boolean): string[] =>
+    isCredential ? ownReadAllowPaths() : readAllowPaths()
   // What the read section mounts for one denyRead entry: a tmpfs (directory)
   // or a /dev/null mask (anything else) on the entry itself; nothing when it
   // is not there; and, when it cannot be inspected, a tmpfs on the deepest
@@ -2123,10 +2130,11 @@ async function generateFilesystemArgs(
       // the stub-skip derivation catches a throw and gives up on the
       // prediction, and the denyRead loop below does not catch one at all.
       const children = retryingTransient(() => fs.readdirSync('/'))
+      const isCredential = credentialDenies.has(p)
       for (const child of children) {
         if (KERNEL_TOP_LEVEL_DIRS.includes(`/${child}`)) continue
         const childLocation = canonicalForm('/' + child)
-        const covered = readAllowPaths().some(allowPath =>
+        const covered = readExceptionsTo(isCredential).some(allowPath =>
           isAtOrUnder(childLocation, nameLocationOf(allowPath)),
         )
         if (covered) {
@@ -2136,6 +2144,7 @@ async function generateFilesystemArgs(
           continue
         }
         entries.push('/' + child)
+        if (isCredential) credentialDenies.add('/' + child)
       }
     }
     if (fs.existsSync('/etc/ssh/ssh_config.d')) {
@@ -2156,6 +2165,7 @@ async function generateFilesystemArgs(
     normalizedPath: string
     mount: ReturnType<typeof readDenyMountOf>
     liftedFile: boolean
+    isCredential: boolean
   }
   // What every denyRead entry mounts and where: ONE walk, whose answers the
   // deny loop, the locations the carve-out gate below reads, and the
@@ -2168,17 +2178,24 @@ async function generateFilesystemArgs(
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
-      .map(p => normalizePathForSandbox(p, { literal: true }))
-      .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
-      .map(normalizedPath => {
+      .map(p => ({
+        normalizedPath: normalizePathForSandbox(p, { literal: true }),
+        isCredential: credentialDenies.has(p),
+      }))
+      .sort(
+        (a, b) =>
+          canonicalDepth(a.normalizedPath) - canonicalDepth(b.normalizedPath),
+      )
+      .map(({ normalizedPath, isCredential }) => {
         const mount = readDenyMountOf(normalizedPath)
         return {
           normalizedPath,
           mount,
+          isCredential,
           liftedFile:
             mount !== undefined &&
             !mount.isDirectory &&
-            readAllowPaths().some(
+            readExceptionsTo(isCredential).some(
               allowPath => nameLocationOf(allowPath) === mount.landing,
             ),
         }
@@ -2919,6 +2936,33 @@ async function generateFilesystemArgs(
         (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
     )
 
+  // What a tmpfs unit binds back. A path whose name lives at or beneath the
+  // landing of a credential deny is bound back by no unit, the library's own
+  // files apart. A path above such a landing is, and the credential deny,
+  // being deeper, is mounted after it.
+  const credentialLandings = readDenyPlan().flatMap(
+    ({ mount, isCredential }) =>
+      mount !== undefined && isCredential ? [mount.landing] : [],
+  )
+  const leftOut = new Set<string>()
+  const outsideCredentials = (p: string): boolean => {
+    const landing = credentialLandings.find(at =>
+      isAtOrUnder(nameLocationOf(p), at),
+    )
+    if (landing !== undefined && !leftOut.has(p)) {
+      leftOut.add(p)
+      logForDebugging(
+        `[Sandbox Linux] ${p} is at or beneath the credential deny ${landing}: not bound back`,
+        { level: 'warn' },
+      )
+    }
+    return landing === undefined
+  }
+  const restorableReadPaths = readAllowPaths().filter(
+    p => ownReadAllowPaths().includes(p) || outsideCredentials(p),
+  )
+  const restorableWritePaths = allowedWritePaths.filter(outsideCredentials)
+
   for (const { normalizedPath, mount, liftedFile } of readDenyPlan()) {
     if (mount === undefined) {
       logForDebugging(
@@ -2961,8 +3005,8 @@ async function generateFilesystemArgs(
       const restoresNothing = isStandIn || unlistable
       const restored = pushReadDenyDirMounts(args, {
         landing,
-        allowedWritePaths: restoresNothing ? [] : allowedWritePaths,
-        readAllowPaths: restoresNothing ? [] : readAllowPaths(),
+        allowedWritePaths: restoresNothing ? [] : restorableWritePaths,
+        readAllowPaths: restoresNothing ? [] : restorableReadPaths,
         resolve: canonicalLocationOf,
         readDenialAround: restoreTarget =>
           readDenialAround(restoreTarget, landing),
